@@ -1,6 +1,7 @@
 package com.example.workspace.note;
 
 import com.example.workspace.exception.ResourceNotFoundException;
+import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -21,7 +22,8 @@ public class NoteController {
     }
 
     @PostMapping
-    public Note createNote(@RequestBody Note note) {
+    public Note createNote(@Valid @RequestBody NoteRequest request) {
+        Note note = new Note(request.title(), request.content());
         return noteRepository.save(note);
     }
 
