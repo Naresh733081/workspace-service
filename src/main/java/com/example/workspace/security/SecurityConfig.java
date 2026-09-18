@@ -25,12 +25,13 @@ public class SecurityConfig {
         http
                 .csrf(csrf -> csrf.disable())
                 .authorizeHttpRequests(auth -> auth
-                        // registration and login must stay open — you can't log in
-                        // to reach the login endpoint
                         .requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
-                        // everything else now genuinely requires an authenticated
-                        // SecurityContext — this is the line that turns a session
-                        // that "exists" into a session that "matters"
+                        // more specific rule must come BEFORE the general
+                        // "anyRequest().authenticated()" rule below — Spring
+                        // Security evaluates these in order and uses the first
+                        // match, so if this were listed after anyRequest(), it
+                        // would never be reached
+                        .requestMatchers("/api/admin/**").hasRole("ADMIN")
                         .anyRequest().authenticated()
                 );
 
