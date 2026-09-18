@@ -20,18 +20,19 @@ public class SecurityConfig {
         this.userDetailsService = userDetailsService;
     }
 
-    // Just added spring-security for PasswordEncoder + AuthenticationManager.
-    // Problem: once it's on the classpath, Spring auto-locks every endpoint
-    // behind a generated login form. Don't want that yet, so permitAll()
-    // everywhere for now. This gets replaced for real authentication
-    // once JWT exists, and we know which routes should actually be public.
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
-                .csrf(csrf -> csrf.disable()) // no cookies/sessions/forms yet, so CSRF isn't doing anything for us here
-                // TODO: swap for .requestMatchers("/api/auth/**").permitAll().anyRequest().authenticated()
-                // once JWT is in
-                .authorizeHttpRequests(auth -> auth.anyRequest().permitAll());
+                .csrf(csrf -> csrf.disable())
+                .authorizeHttpRequests(auth -> auth
+                        // registration and login must stay open — you can't log in
+                        // to reach the login endpoint
+                        .requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
+                        // everything else now genuinely requires an authenticated
+                        // SecurityContext — this is the line that turns a session
+                        // that "exists" into a session that "matters"
+                        .anyRequest().authenticated()
+                );
 
         return http.build();
     }
