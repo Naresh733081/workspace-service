@@ -1,6 +1,7 @@
 package com.example.workspace.security;
 
 import com.example.workspace.exception.ApiError;
+import com.example.workspace.exception.ErrorCode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -28,12 +29,7 @@ public class RestAuthenticationEntryPoint implements AuthenticationEntryPoint {
 
     @Override
     public void commence(HttpServletRequest request, HttpServletResponse response, AuthenticationException authException) throws IOException {
-        ApiError body = ApiError.of(
-                HttpStatus.UNAUTHORIZED.value(),
-                "UNAUTHORIZED",
-                "Authentication is required to access this resource",
-                request.getRequestURI()
-        );
+        ApiError body = ApiError.of(ErrorCode.UNAUTHORIZED, request.getRequestURI());
 
         response.setStatus(HttpStatus.UNAUTHORIZED.value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);

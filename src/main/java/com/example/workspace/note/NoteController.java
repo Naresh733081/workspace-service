@@ -1,6 +1,7 @@
 package com.example.workspace.note;
 
-import com.example.workspace.exception.ResourceNotFoundException;
+import com.example.workspace.exception.ApiException;
+import com.example.workspace.exception.ErrorCode;
 import com.example.workspace.user.UserDetailsImpl;
 import jakarta.validation.Valid;
 import org.springframework.security.core.Authentication;
@@ -40,7 +41,7 @@ public class NoteController {
         return noteRepository.findByIdAndUserId(id, currentUserId())
                 // same 404 whether the id doesn't exist or belongs to
                 // someone else — deliberately not leaking which
-                .orElseThrow(() -> new ResourceNotFoundException("Note not found: " + id));
+                .orElseThrow(() -> new ApiException(ErrorCode.RESOURCE_NOT_FOUND, "Note not found: " + id));
     }
 
     @PostMapping
