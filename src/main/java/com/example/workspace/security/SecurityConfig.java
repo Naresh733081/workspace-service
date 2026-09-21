@@ -16,11 +16,14 @@ public class SecurityConfig {
 
     private final UserDetailsServiceImpl userDetailsService;
     private final RestAuthenticationEntryPoint authenticationEntryPoint;
+    private final RestAccessDeniedHandler accessDeniedHandler;
 
     public SecurityConfig(UserDetailsServiceImpl userDetailsService,
-                          RestAuthenticationEntryPoint authenticationEntryPoint) {
+                          RestAuthenticationEntryPoint authenticationEntryPoint,
+                          RestAccessDeniedHandler accessDeniedHandler) {
         this.userDetailsService = userDetailsService;
         this.authenticationEntryPoint = authenticationEntryPoint;
+        this.accessDeniedHandler = accessDeniedHandler;
     }
 
     @Bean
@@ -37,10 +40,12 @@ public class SecurityConfig {
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
                         .anyRequest().authenticated()
                 )
-                // tells Spring Security: when an unauthenticated request is
-                // rejected, use OUR handler to write the response, not the
-                // built-in one that redirects to a login page / writes a blank 403
-                .exceptionHandling(ex -> ex.authenticationEntryPoint(authenticationEntryPoint));
+                .exceptionHandling(ex -> ex
+                        // Triggers (401 Unauthorized) when an unauthenticated user tries to access a protected route
+                        .authenticationEntryPoint(authenticationEntryPoint)
+                        // Triggers (403 Forbidden) when an authenticated user lacks the required roles/permissions
+                        .accessDeniedHandler(accessDeniedHandler)
+                );
 
         return http.build();
     }
