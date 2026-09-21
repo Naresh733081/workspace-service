@@ -15,9 +15,12 @@ import org.springframework.security.web.SecurityFilterChain;
 public class SecurityConfig {
 
     private final UserDetailsServiceImpl userDetailsService;
+    private final RestAuthenticationEntryPoint authenticationEntryPoint;
 
-    public SecurityConfig(UserDetailsServiceImpl userDetailsService) {
+    public SecurityConfig(UserDetailsServiceImpl userDetailsService,
+                          RestAuthenticationEntryPoint authenticationEntryPoint) {
         this.userDetailsService = userDetailsService;
+        this.authenticationEntryPoint = authenticationEntryPoint;
     }
 
     @Bean
@@ -33,7 +36,11 @@ public class SecurityConfig {
                         // would never be reached
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
                         .anyRequest().authenticated()
-                );
+                )
+                // tells Spring Security: when an unauthenticated request is
+                // rejected, use OUR handler to write the response, not the
+                // built-in one that redirects to a login page / writes a blank 403
+                .exceptionHandling(ex -> ex.authenticationEntryPoint(authenticationEntryPoint));
 
         return http.build();
     }
