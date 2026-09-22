@@ -2,6 +2,7 @@ package com.example.workspace.auth;
 
 import com.example.workspace.exception.ApiException;
 import com.example.workspace.exception.ErrorCode;
+import com.example.workspace.security.JwtService;
 import com.example.workspace.user.RegisterRequest;
 import com.example.workspace.user.User;
 import com.example.workspace.user.UserDetailsImpl;
@@ -27,6 +28,7 @@ public class AuthController {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final AuthenticationManager authenticationManager;
+    private final JwtService jwtService;
 
     // Responsible for actually WRITING the SecurityContext somewhere it will
     // survive between requests. HttpSessionSecurityContextRepository is the
@@ -38,10 +40,12 @@ public class AuthController {
 
     public AuthController(UserRepository userRepository,
                           PasswordEncoder passwordEncoder,
-                          AuthenticationManager authenticationManager) {
+                          AuthenticationManager authenticationManager,
+                          JwtService jwtService) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.authenticationManager = authenticationManager;
+        this.jwtService = jwtService;
     }
 
     @PostMapping("/register")
@@ -55,7 +59,7 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<String> login(@Valid @RequestBody LoginRequest request,
+    public ResponseEntity<?> login(@Valid @RequestBody LoginRequest request,
                                       HttpServletRequest httpRequest,
                                       HttpServletResponse httpResponse) {
         Authentication authRequest = new UsernamePasswordAuthenticationToken(request.email(), request.password());
@@ -79,7 +83,11 @@ public class AuthController {
         // is what causes the JSESSIONID cookie to appear on the response.
         securityContextRepository.saveContext(context, httpRequest, httpResponse);
 
-        return ResponseEntity.ok().body("login successfully");
+        // issue a token. Nothing consumes this yet — we're proving
+        // generation works before building anything that reads it back.
+        String accessToken = jwtService.generateToken(authResult.getName());
+
+        return ResponseEntity.ok(new LoginResponse(accessToken));
     }
 
     @GetMapping("/me")
