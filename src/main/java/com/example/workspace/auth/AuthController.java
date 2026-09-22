@@ -67,22 +67,6 @@ public class AuthController {
         // throws BadCredentialsException on failure
         Authentication authResult = authenticationManager.authenticate(authRequest);
 
-        // Up to this point, authResult only exists on the stack of this one
-        // method call. SecurityContextHolder is what the REST of the app
-        // (this request, and — once persisted below — future requests) reads
-        // to find out "who is currently authenticated."
-        SecurityContext context = SecurityContextHolder.createEmptyContext();
-        context.setAuthentication(authResult);
-        SecurityContextHolder.setContext(context);
-
-        // This is the step that actually makes it survive past this one
-        // request. Without this line, the context above would be correct for
-        // the duration of THIS request only, then vanish — same problem as
-        // before, just moved one line later. This call is what triggers
-        // session creation and writes SPRING_SECURITY_CONTEXT into it, which
-        // is what causes the JSESSIONID cookie to appear on the response.
-        securityContextRepository.saveContext(context, httpRequest, httpResponse);
-
         // issue a token. Nothing consumes this yet — we're proving
         // generation works before building anything that reads it back.
         String accessToken = jwtService.generateToken(authResult.getName());

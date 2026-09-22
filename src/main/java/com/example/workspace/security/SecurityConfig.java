@@ -51,37 +51,13 @@ public class SecurityConfig {
                         // Triggers (403 Forbidden) when an authenticated user lacks the required roles/permissions
                         .accessDeniedHandler(accessDeniedHandler)
                 )
-                //session gets created the first time login writes a
-                // SecurityContext to it, and NOT before. We're just naming
-                // that default now instead of leaving it unstated. The
-                // alternatives are ALWAYS (create one for every request,
-                // wasteful), NEVER (Security won't create one, but will read
-                // an existing one), and STATELESS (Security won't create OR
-                // read a session at all — this is what JWT will switch us to)
+                // this is the actual switch. STATELESS means: never create a
+                // session, never consult one even if a stray JSESSIONID cookie
+                // shows up on a request. Every request is authenticated purely
+                // from what it carries with it (the bearer token) — nothing
+                // the server remembers about prior requests.
                 .sessionManagement(session -> session
-                        .sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED)
-                        // on successful login, issue a brand-new session ID
-                        // rather than reusing whatever session (if any) existed
-                        // before authentication. This is the framework default —
-                        // again, naming it rather than leaving it implicit.
-                        // Defends against session fixation: without this, an
-                        // attacker who gets a victim to browse using a session
-                        // ID the attacker already knows could hijack that
-                        // session the moment the victim logs in on it.
-                        .sessionFixation(fixation -> fixation.changeSessionId())
-                )
-                // logout is a Spring Security filter, not a controller method —
-                // it's declared as part of the filter chain, same layer as
-                // authentication, not something AuthController implements
-                .logout(logout -> logout
-                        .logoutUrl("/api/auth/logout")
-                        .invalidateHttpSession(true)
-                        .clearAuthentication(true)
-                        // default logout success behavior is an HTTP redirect
-                        // (built for browser form-based logout) — we're an API,
-                        // so we want a plain 200 instead
-                        .logoutSuccessHandler((request, response, authentication) ->
-                                response.setStatus(org.springframework.http.HttpStatus.OK.value()))
+                        .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 )
                 // Our filter needs to run BEFORE Spring's own
                 // UsernamePasswordAuthenticationFilter (the one that handles
