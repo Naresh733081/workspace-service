@@ -21,11 +21,18 @@ import java.io.IOException;
 @Component
 public class RestAuthenticationEntryPoint implements AuthenticationEntryPoint {
 
-    // We need this because this code runs early in the security chain,
-    // so Spring's automatic JSON converter isn't available yet.
-    // findAndRegisterModules() is required so Jackson can handle
-    // modern Java 8 types like 'Instant' without crashing.
-    private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
+    private final ObjectMapper objectMapper;
+
+    // Inject Spring's own autoconfigured ObjectMapper instead of building
+    // a new one by hand. This is the exact same instance Spring uses to
+    // serialize every normal controller response and every
+    // GlobalExceptionHandler response — using it here guarantees identical
+    // formatting (ISO-8601 timestamps, same naming strategy, etc.) instead
+    // of two independently-configured JSON serializers quietly drifting
+    // apart, which is exactly the bug we just hit.
+    public RestAuthenticationEntryPoint(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
 
     @Override
     public void commence(HttpServletRequest request, HttpServletResponse response, AuthenticationException authException) throws IOException {
