@@ -11,6 +11,7 @@ public enum ErrorCode {
     VALIDATION_ERROR(HttpStatus.BAD_REQUEST, "Request validation failed"),
     UNAUTHORIZED(HttpStatus.UNAUTHORIZED, "Authentication is required to access this resource"),
     ACCESS_DENIED(HttpStatus.FORBIDDEN, "You do not have permission to access this resource"),
+    INVALID_TOKEN(HttpStatus.UNAUTHORIZED, "Invalid or expired authentication token"),
     RESOURCE_NOT_FOUND(HttpStatus.NOT_FOUND, "The requested resource was not found"),
     CONFLICT(HttpStatus.CONFLICT, "The resource already exists"),
     INTERNAL_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "Something went wrong");

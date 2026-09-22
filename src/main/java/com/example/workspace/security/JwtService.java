@@ -1,5 +1,9 @@
 package com.example.workspace.security;
 
+import com.example.workspace.exception.ApiException;
+import com.example.workspace.exception.ErrorCode;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.JwtException;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.security.Keys;
 import org.springframework.beans.factory.annotation.Value;
@@ -9,9 +13,6 @@ import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
 
-// Responsible for ONE thing at this stage: turning an authenticated
-// identity into a signed token. Validating a token that comes back in on
-// a later request is a genuinely separate responsibility
 @Service
 public class JwtService {
 
@@ -45,5 +46,32 @@ public class JwtService {
                 // a password or anything sensitive in the claims.
                 .signWith(signingKey)
                 .compact();
+    }
+
+    // Parses and verifies the token in one step. jjwt checks the signature
+    // AND the expiration as part of parsing itself — if either is wrong, it
+    // throws before we ever get a Claims object back. We deliberately
+    // collapse every failure reason (bad signature, expired, malformed) into
+    // the SAME ApiException/ErrorCode. Telling a caller "the signature was
+    // wrong" vs "it expired" vs "it was garbage" leaks information about
+    // WHY their forged token failed — useless for a legitimate client, and
+    // mildly helpful to an attacker probing the endpoint.
+    public String extractSubject(String token) {
+        return parseClaims(token).getSubject();
+    }
+
+    private Claims parseClaims(String token) {
+        try {
+            return Jwts.parser()
+                    .verifyWith(signingKey)
+                    .build()
+                    .parseSignedClaims(token)
+                    .getPayload();
+        } catch (JwtException | IllegalArgumentException ex) {
+            // JwtException covers ExpiredJwtException, SignatureException,
+            // MalformedJwtException — all of jjwt's failure cases share
+            // this common parent, so one catch block handles all of them.
+            throw new ApiException(ErrorCode.INVALID_TOKEN);
+        }
     }
 }
