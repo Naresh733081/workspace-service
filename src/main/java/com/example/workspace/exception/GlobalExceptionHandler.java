@@ -3,10 +3,13 @@ package com.example.workspace.exception;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.sql.SQLException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -44,6 +47,40 @@ public class GlobalExceptionHandler {
         log.info("Validation failed: path={} message={}", request.getRequestURI(), message);
 
         return ResponseEntity.status(ErrorCode.VALIDATION_ERROR.getHttpStatus()).body(body);
+    }
+
+    @ExceptionHandler(DataAccessException.class)
+    public ResponseEntity<ApiError> handleDataAccess(DataAccessException ex, HttpServletRequest request) {
+        // Spring wraps the real driver exception several layers deep. We walk
+        // the cause chain explicitly to pull out the actual SQLState + message
+        // instead of relying on the top-level message, which is often a
+        // generic phrase like "could not execute statement" — see the
+        // demonstration that motivated this commit.
+        String sqlState = null;
+        String rootMessage = ex.getMessage();
+
+        Throwable cause = ex;
+        while (cause != null) {
+            if (cause instanceof SQLException sqlEx) {
+                sqlState = sqlEx.getSQLState();
+                rootMessage = sqlEx.getMessage();
+                break;
+            }
+            cause = cause.getCause();
+        }
+
+        // structured, filterable fields — sqlState and rootMessage are
+        // separate arguments, not smashed into one string, so a log
+        // aggregator (or a future DB-backed log table) can query on them
+        // independently, e.g. "every failure with sqlState=23502"
+        log.error("Database exception: path={} sqlState={} message={}",
+                request.getRequestURI(), sqlState, rootMessage, ex);
+
+        // client still gets our generic shape — a raw SQL error message is
+        // exactly the kind of internal detail we never
+        // expose over HTTP
+        ApiError body = ApiError.of(ErrorCode.INTERNAL_ERROR, request.getRequestURI());
+        return ResponseEntity.status(ErrorCode.INTERNAL_ERROR.getHttpStatus()).body(body);
     }
 
     @ExceptionHandler(Exception.class)
