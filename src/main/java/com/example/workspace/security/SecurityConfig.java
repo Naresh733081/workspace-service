@@ -34,14 +34,16 @@ public class SecurityConfig {
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
+                // Stateless bearer-token API — no cookies, no browser forms
+                // submitting to this backend, so there's no CSRF attack
+                // surface to protect.
                 .csrf(csrf -> csrf.disable())
                 .authorizeHttpRequests(auth -> auth
+                        // must stay open — these ARE how you obtain the
+                        // credentials/token needed for everything else
                         .requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
-                        // more specific rule must come BEFORE the general
-                        // "anyRequest().authenticated()" rule below — Spring
-                        // Security evaluates these in order and uses the first
-                        // match, so if this were listed after anyRequest(), it
-                        // would never be reached
+                        // order matters: more specific rules must be listed
+                        // before the general authenticated() catch-all below
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
                         .anyRequest().authenticated()
                 )
@@ -51,11 +53,8 @@ public class SecurityConfig {
                         // Triggers (403 Forbidden) when an authenticated user lacks the required roles/permissions
                         .accessDeniedHandler(accessDeniedHandler)
                 )
-                // this is the actual switch. STATELESS means: never create a
-                // session, never consult one even if a stray JSESSIONID cookie
-                // shows up on a request. Every request is authenticated purely
-                // from what it carries with it (the bearer token) — nothing
-                // the server remembers about prior requests.
+                // no session, ever — every request authenticates itself
+                // independently via JwtAuthenticationFilter below
                 .sessionManagement(session -> session
                         .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 )
