@@ -7,6 +7,7 @@ import com.example.workspace.user.RegisterRequest;
 import com.example.workspace.user.User;
 import com.example.workspace.user.UserDetailsImpl;
 import com.example.workspace.user.UserRepository;
+import io.jsonwebtoken.Claims;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
@@ -14,12 +15,13 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.context.HttpSessionSecurityContextRepository;
 import org.springframework.security.web.context.SecurityContextRepository;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/auth")
@@ -29,6 +31,7 @@ public class AuthController {
     private final PasswordEncoder passwordEncoder;
     private final AuthenticationManager authenticationManager;
     private final JwtService jwtService;
+    private final RefreshTokenRepository refreshTokenRepository;
 
     // Responsible for actually WRITING the SecurityContext somewhere it will
     // survive between requests. HttpSessionSecurityContextRepository is the
@@ -41,11 +44,13 @@ public class AuthController {
     public AuthController(UserRepository userRepository,
                           PasswordEncoder passwordEncoder,
                           AuthenticationManager authenticationManager,
-                          JwtService jwtService) {
+                          JwtService jwtService,
+                          RefreshTokenRepository refreshTokenRepository) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.authenticationManager = authenticationManager;
         this.jwtService = jwtService;
+        this.refreshTokenRepository = refreshTokenRepository;
     }
 
     @PostMapping("/register")
@@ -60,18 +65,58 @@ public class AuthController {
 
     @PostMapping("/login")
     public ResponseEntity<?> login(@Valid @RequestBody LoginRequest request,
-                                      HttpServletRequest httpRequest,
-                                      HttpServletResponse httpResponse) {
+                                   HttpServletRequest httpRequest,
+                                   HttpServletResponse httpResponse) {
         Authentication authRequest = new UsernamePasswordAuthenticationToken(request.email(), request.password());
 
         // throws BadCredentialsException on failure
         Authentication authResult = authenticationManager.authenticate(authRequest);
 
-        // issue a token. Nothing consumes this yet — we're proving
-        // generation works before building anything that reads it back.
-        String accessToken = jwtService.generateToken(authResult.getName());
+        // UserDetailsImpl already carries the id — DaoAuthenticationProvider
+        // loaded it once during authenticate() above via
+        // UserDetailsServiceImpl. No need to hit the database again for the
+        // same row.
+        UserDetailsImpl principal = (UserDetailsImpl) authResult.getPrincipal();
 
-        return ResponseEntity.ok(new LoginResponse(accessToken));
+        LoginResponse tokens = issueTokenPair(principal.getUsername(), principal.getId());
+        return ResponseEntity.ok(tokens);
+    }
+
+    @PostMapping("/refresh")
+    public ResponseEntity<LoginResponse> refresh(@Valid @RequestBody RefreshRequest request) {
+        Claims claims = jwtService.extractClaimsForRefreshToken(request.refreshToken());
+        String jti = claims.getId();
+        String email = claims.getSubject();
+
+        RefreshToken stored = refreshTokenRepository.findByJti(jti)
+                .orElseThrow(() -> new ApiException(ErrorCode.INVALID_TOKEN));
+
+        if (stored.isRevoked()) {
+            throw new ApiException(ErrorCode.INVALID_TOKEN);
+        }
+
+        stored.revoke();
+        refreshTokenRepository.save(stored);
+
+        // refresh IS a case where we genuinely don't have the user id handy
+        // (only the email, from the token claims) — one lookup here is
+        // unavoidable and correct, unlike login where we already had it
+        Long userId = stored.getUserId();
+        return ResponseEntity.ok(issueTokenPair(email, userId));
+    }
+
+    private LoginResponse issueTokenPair(String email, Long userId) {
+        String accessToken = jwtService.generateAccessToken(email);
+
+        String jti = UUID.randomUUID().toString();
+        JwtService.IssuedToken refresh = jwtService.generateRefreshTokenDetailed(email, jti);
+
+        // expiresAt comes directly from the token we just built — same value
+        // encoded in the JWT's own "exp" claim, not a separately hardcoded
+        // duration that could drift out of sync with jwt.refresh-token-expiration-ms
+        refreshTokenRepository.save(new RefreshToken(jti, userId, refresh.expiresAt()));
+
+        return new LoginResponse(accessToken, refresh.token());
     }
 
     @GetMapping("/me")

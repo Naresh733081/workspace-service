@@ -59,7 +59,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         String token = header.substring(BEARER_PREFIX.length());
 
         try {
-            String email = jwtService.extractSubject(token);
+            String email = jwtService.extractSubjectForAccessToken(token);
 
             // Don't clobber an already-authenticated context. In practice
             // this matters less right now (a request either has a session

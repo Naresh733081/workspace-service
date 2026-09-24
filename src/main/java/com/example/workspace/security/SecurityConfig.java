@@ -49,7 +49,7 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         // must stay open — these ARE how you obtain the
                         // credentials/token needed for everything else
-                        .requestMatchers("/api/auth/register", "/api/auth/login").permitAll()
+                        .requestMatchers("/api/auth/register", "/api/auth/login","/api/auth/refresh").permitAll()
                         // order matters: more specific rules must be listed
                         // before the general authenticated() catch-all below
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
