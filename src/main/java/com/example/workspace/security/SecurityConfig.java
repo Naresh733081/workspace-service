@@ -70,6 +70,92 @@ public class SecurityConfig {
                 .sessionManagement(session -> session
                         .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 )
+                .headers(headers -> headers
+                        // ── X-Content-Type-Options: nosniff ──────────────────
+                        // Without this, some older browsers will try to
+                        // "guess" a response's content type by sniffing its
+                        // bytes, ignoring the Content-Type header we actually
+                        // sent. This matters because an attacker who can get
+                        // us to serve THEIR data (e.g. an uploaded file)
+                        // could craft bytes that look like they start with
+                        // "<script>" and get a browser to execute it as HTML/
+                        // JS even though we declared it as e.g.
+                        // "application/json" or "image/png". This header
+                        // forces the browser to trust our declared
+                        // Content-Type and never guess. Spring Security
+                        // enables this by default already — we're setting it
+                        // explicitly so it's a documented decision, not a
+                        // silent default.
+                        .contentTypeOptions(contentTypeOptions -> {
+                        })
+
+                        // ── X-Frame-Options: DENY ────────────────────────────
+                        // Prevents this API's responses from being rendered
+                        // inside an <iframe> on another site. This defends
+                        // against clickjacking — an attacker embedding an
+                        // invisible iframe of an authenticated page over a
+                        // fake UI, tricking a logged-in user into clicking
+                        // something they didn't mean to. We're a JSON API,
+                        // not HTML pages meant to be viewed directly, so
+                        // there is genuinely no legitimate reason for any
+                        // response from this backend to ever be framed.
+                        // DENY (not SAMEORIGIN) because there's no frontend
+                        // page served BY this backend that would need to
+                        // frame itself.
+                        .frameOptions(frameOptions -> frameOptions.deny())
+
+                        // ── Strict-Transport-Security ────────────────────────
+                        // Tells the browser: for the next `maxAgeInSeconds`,
+                        // NEVER attempt to reach this host over plain HTTP
+                        // again, even if the user types http:// or clicks an
+                        // http:// link — force HTTPS automatically, before
+                        // even making the request. This defends against SSL-
+                        // stripping attacks, where a network-level attacker
+                        // (e.g. on public wifi) intercepts an initial HTTP
+                        // request before it gets upgraded to HTTPS. Only
+                        // meaningful once actually deployed behind HTTPS
+                        // (Render provides this) — harmless locally over
+                        // plain http on localhost, browsers ignore HSTS
+                        // headers received over non-HTTPS connections.
+                        // includeSubDomains extends the same protection to
+                        // any subdomain of the deployed host.
+                        .httpStrictTransportSecurity(hsts -> hsts
+                                .includeSubDomains(true)
+                                .maxAgeInSeconds(31536000) // 1 year
+                        )
+
+                        // ── Referrer-Policy: strict-origin-when-cross-origin ─
+                        // Controls what gets sent in the Referer header when a
+                        // browser navigates AWAY from a page served by this
+                        // API to somewhere else (relevant mainly for any
+                        // static/error pages this backend might ever serve
+                        // directly, and for outbound links in something like
+                        // a password reset email later). Prevents leaking
+                        // full URLs — which could contain query params, IDs,
+                        // or tokens if a mistake was ever made and one ended
+                        // up in a URL — to third-party destinations. This is
+                        // the modern, balanced default recommended by OWASP:
+                        // full URL on same-origin navigation, origin only
+                        // (no path/query) cross-origin, nothing at all on a
+                        // downgrade from HTTPS to HTTP.
+                        .referrerPolicy(referrer -> referrer
+                                .policy(org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter.ReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN)
+                        )
+
+                        // ── Cache-Control on sensitive responses ─────────────
+                        // Spring Security's default header writer already adds
+                        // Cache-Control: no-cache, no-store, must-revalidate
+                        // on every response by default — preventing a shared
+                        // proxy or the browser's disk cache from persisting a
+                        // response that might contain a token or personal
+                        // data (e.g. GET /api/auth/me, GET /api/notes). We're
+                        // not overriding this — Spring's default here is
+                        // already correct — just noting explicitly that this
+                        // is active and why, rather than leaving it as an
+                        // unexplained default.
+                        .cacheControl(cache -> {
+                        })
+                )
                 // Spring Security orders same-position filters by registration order — registering rateLimitFilter
                 // first places it ahead of jwtAuthenticationFilter in the actual chain,
                 // so throttled requests never reach JWT validation at all
