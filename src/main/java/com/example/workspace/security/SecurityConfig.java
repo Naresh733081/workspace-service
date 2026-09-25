@@ -22,17 +22,21 @@ public class SecurityConfig {
     private final RestAccessDeniedHandler accessDeniedHandler;
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final CorsConfigurationSource corsConfigurationSource;
+    private final RateLimitFilter rateLimitFilter;
+
 
     public SecurityConfig(UserDetailsServiceImpl userDetailsService,
                           RestAuthenticationEntryPoint authenticationEntryPoint,
                           RestAccessDeniedHandler accessDeniedHandler,
                           JwtAuthenticationFilter jwtAuthenticationFilter,
-                          CorsConfigurationSource corsConfigurationSource) {
+                          CorsConfigurationSource corsConfigurationSource,
+                          RateLimitFilter rateLimitFilter) {
         this.userDetailsService = userDetailsService;
         this.authenticationEntryPoint = authenticationEntryPoint;
         this.accessDeniedHandler = accessDeniedHandler;
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
         this.corsConfigurationSource = corsConfigurationSource;
+        this.rateLimitFilter = rateLimitFilter;
     }
 
     @Bean
@@ -49,7 +53,7 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         // must stay open — these ARE how you obtain the
                         // credentials/token needed for everything else
-                        .requestMatchers("/api/auth/register", "/api/auth/login","/api/auth/refresh").permitAll()
+                        .requestMatchers("/api/auth/register", "/api/auth/login", "/api/auth/refresh").permitAll()
                         // order matters: more specific rules must be listed
                         // before the general authenticated() catch-all below
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
@@ -66,6 +70,10 @@ public class SecurityConfig {
                 .sessionManagement(session -> session
                         .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 )
+                // Spring Security orders same-position filters by registration order — registering rateLimitFilter
+                // first places it ahead of jwtAuthenticationFilter in the actual chain,
+                // so throttled requests never reach JWT validation at all
+                .addFilterBefore(rateLimitFilter, UsernamePasswordAuthenticationFilter.class)
                 // Our filter needs to run BEFORE Spring's own
                 // UsernamePasswordAuthenticationFilter (the one that handles
                 // form-login style POSTs) in the chain's execution order, so
