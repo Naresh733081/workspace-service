@@ -5,9 +5,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.sql.SQLException;
 
@@ -81,6 +83,23 @@ public class GlobalExceptionHandler {
         // expose over HTTP
         ApiError body = ApiError.of(ErrorCode.INTERNAL_ERROR, request.getRequestURI());
         return ResponseEntity.status(ErrorCode.INTERNAL_ERROR.getHttpStatus()).body(body);
+    }
+
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<ApiError> handleNoResource(NoResourceFoundException ex, HttpServletRequest request) {
+        // a client hitting a URL that doesn't exist is routine, not a bug of
+        // ours. INFO and no stack trace, otherwise scanners and typos bury
+        // the real errors in the log
+        log.info("No handler for path: {}", request.getRequestURI());
+        ApiError body = ApiError.of(ErrorCode.RESOURCE_NOT_FOUND, request.getRequestURI());
+        return ResponseEntity.status(ErrorCode.RESOURCE_NOT_FOUND.getHttpStatus()).body(body);
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiError> handleUnreadableBody(HttpMessageNotReadableException ex, HttpServletRequest request) {
+        log.info("Unreadable request body: path={}", request.getRequestURI());
+        ApiError body = ApiError.of(ErrorCode.VALIDATION_ERROR, "Malformed or missing request body", request.getRequestURI());
+        return ResponseEntity.status(ErrorCode.VALIDATION_ERROR.getHttpStatus()).body(body);
     }
 
     @ExceptionHandler(Exception.class)

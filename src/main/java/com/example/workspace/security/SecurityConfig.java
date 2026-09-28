@@ -54,6 +54,11 @@ public class SecurityConfig {
                         // must stay open — these ARE how you obtain the
                         // credentials/token needed for everything else
                         .requestMatchers("/api/auth/register", "/api/auth/login", "/api/auth/refresh").permitAll()
+                        // health must be reachable without a token, since platform probes have none
+                        .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                        // second lock: even if someone later adds "env" to the exposure
+                        // list, only an admin token gets through
+                        .requestMatchers("/actuator/**").hasRole("ADMIN")
                         // order matters: more specific rules must be listed
                         // before the general authenticated() catch-all below
                         .requestMatchers("/api/admin/**").hasRole("ADMIN")
