@@ -14,7 +14,8 @@ public enum ErrorCode {
     INVALID_TOKEN(HttpStatus.UNAUTHORIZED, "Invalid or expired authentication token"),
     RESOURCE_NOT_FOUND(HttpStatus.NOT_FOUND, "The requested resource was not found"),
     CONFLICT(HttpStatus.CONFLICT, "The resource already exists"),
-    INTERNAL_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "Something went wrong");
+    INTERNAL_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "Something went wrong"),
+    PAYLOAD_TOO_LARGE(HttpStatus.PAYLOAD_TOO_LARGE, "Request body is too large");
 
     private final HttpStatus httpStatus;
     private final String defaultMessage;

@@ -23,6 +23,7 @@ public class SecurityConfig {
     private final JwtAuthenticationFilter jwtAuthenticationFilter;
     private final CorsConfigurationSource corsConfigurationSource;
     private final RateLimitFilter rateLimitFilter;
+    private final RequestSizeLimitFilter requestSizeLimitFilter;
 
 
     public SecurityConfig(UserDetailsServiceImpl userDetailsService,
@@ -30,13 +31,15 @@ public class SecurityConfig {
                           RestAccessDeniedHandler accessDeniedHandler,
                           JwtAuthenticationFilter jwtAuthenticationFilter,
                           CorsConfigurationSource corsConfigurationSource,
-                          RateLimitFilter rateLimitFilter) {
+                          RateLimitFilter rateLimitFilter,
+                          RequestSizeLimitFilter requestSizeLimitFilter) {
         this.userDetailsService = userDetailsService;
         this.authenticationEntryPoint = authenticationEntryPoint;
         this.accessDeniedHandler = accessDeniedHandler;
         this.jwtAuthenticationFilter = jwtAuthenticationFilter;
         this.corsConfigurationSource = corsConfigurationSource;
         this.rateLimitFilter = rateLimitFilter;
+        this.requestSizeLimitFilter = requestSizeLimitFilter;
     }
 
     @Bean
@@ -161,6 +164,7 @@ public class SecurityConfig {
                         .cacheControl(cache -> {
                         })
                 )
+                .addFilterBefore(requestSizeLimitFilter, UsernamePasswordAuthenticationFilter.class)
                 // Spring Security orders same-position filters by registration order — registering rateLimitFilter
                 // first places it ahead of jwtAuthenticationFilter in the actual chain,
                 // so throttled requests never reach JWT validation at all

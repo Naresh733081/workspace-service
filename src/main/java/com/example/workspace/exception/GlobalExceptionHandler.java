@@ -97,6 +97,16 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ApiError> handleUnreadableBody(HttpMessageNotReadableException ex, HttpServletRequest request) {
+        // the size filter's exception arrives wrapped inside this one when the
+        // limit trips mid-read (chunked or dishonest Content-Length)
+        for (Throwable t = ex; t != null; t = t.getCause()) {
+            if (t instanceof RequestTooLargeException) {
+                log.warn("Request body too large while streaming: path={}", request.getRequestURI());
+                ApiError tooLarge = ApiError.of(ErrorCode.PAYLOAD_TOO_LARGE, request.getRequestURI());
+                return ResponseEntity.status(ErrorCode.PAYLOAD_TOO_LARGE.getHttpStatus()).body(tooLarge);
+            }
+        }
+
         log.info("Unreadable request body: path={}", request.getRequestURI());
         ApiError body = ApiError.of(ErrorCode.VALIDATION_ERROR, "Malformed or missing request body", request.getRequestURI());
         return ResponseEntity.status(ErrorCode.VALIDATION_ERROR.getHttpStatus()).body(body);
