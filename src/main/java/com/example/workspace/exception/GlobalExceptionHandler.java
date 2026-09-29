@@ -6,6 +6,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -110,6 +112,20 @@ public class GlobalExceptionHandler {
         log.info("Unreadable request body: path={}", request.getRequestURI());
         ApiError body = ApiError.of(ErrorCode.VALIDATION_ERROR, "Malformed or missing request body", request.getRequestURI());
         return ResponseEntity.status(ErrorCode.VALIDATION_ERROR.getHttpStatus()).body(body);
+    }
+
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    public ResponseEntity<ApiError> handleUnsupportedMediaType(HttpMediaTypeNotSupportedException ex, HttpServletRequest request) {
+        log.info("Unsupported content type: path={} contentType={}", request.getRequestURI(), ex.getContentType());
+        ApiError body = ApiError.of(ErrorCode.UNSUPPORTED_MEDIA_TYPE, request.getRequestURI());
+        return ResponseEntity.status(ErrorCode.UNSUPPORTED_MEDIA_TYPE.getHttpStatus()).body(body);
+    }
+
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<ApiError> handleMethodNotAllowed(HttpRequestMethodNotSupportedException ex, HttpServletRequest request) {
+        log.info("Method not allowed: path={} method={}", request.getRequestURI(), ex.getMethod());
+        ApiError body = ApiError.of(ErrorCode.METHOD_NOT_ALLOWED, request.getRequestURI());
+        return ResponseEntity.status(ErrorCode.METHOD_NOT_ALLOWED.getHttpStatus()).body(body);
     }
 
     @ExceptionHandler(Exception.class)
