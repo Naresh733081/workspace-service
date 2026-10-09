@@ -1,65 +1,68 @@
-# Security Architecture — In-Depth Notes
+# Security, explained like I'd explain it to a teammate
 
-This document exists because a git log full of "why" comments is still
-scattered across thirty-plus commits. This is the same reasoning,
-gathered in one place, written the way I'd explain it to a teammate
-sitting next to me — not a spec, not marketing copy for the design,
-just: here's the problem, here's what we picked, here's what else we
-considered, here's what it would look like if we'd built this five years
-ago on Java 8, and here's where it's still weak.
+This is the long version of every security decision in this backend. The
+commit messages tell you *what* changed. This tells you *why*, what else
+I looked at, what it would look like on an older JDK, and where I know it's
+still weak.
 
-Read this top to bottom once, then use it as a reference. Every section
-follows the same shape:
+I wrote it for two kinds of reader. If you're using this repo as a starting
+point for your own project, read the "what else we could have done" parts
+first, because they're where you decide whether to keep my choice or swap it.
+If you're reviewing the code, read the "where it's still weak" parts. I'd
+rather you hear about the holes from me.
 
-- **The problem** — what breaks without this
-- **What we built** — the actual mechanism
-- **Alternatives we considered** — and why we didn't pick them
-- **Java 17 vs Java 8** — what changes if you're stuck on an older JDK
-- **Where this is weak** — because pretending otherwise helps no one
+> **How to read this:** every section has the same five beats. *Why it matters*,
+> *what we built*, *what else we could have done*, *Java 17 vs Java 8*, and
+> *where it's still weak*. Skip around freely. Nothing depends on reading in order.
+
+> **A word on honesty:** a few things in this repo are deliberately unfinished.
+> They're marked **Known gap** and collected at the end. Nothing here is
+> hidden, and none of it is "we'll fix it later" without saying so.
 
 ---
 
-## Table of contents
+## Contents
 
-1. [Password storage](#1-password-storage)
-2. [The authentication call chain](#2-the-authentication-call-chain)
-3. [Sessions vs JWT — the actual tradeoff](#3-sessions-vs-jwt--the-actual-tradeoff)
-4. [JWT structure and signing](#4-jwt-structure-and-signing)
-5. [Access + refresh tokens](#5-access--refresh-tokens)
-6. [The Spring Security filter chain](#6-the-spring-security-filter-chain)
-7. [Authorization — roles vs the alternatives](#7-authorization--roles-vs-the-alternatives)
-8. [Resource ownership vs authorization](#8-resource-ownership-vs-authorization)
-9. [CORS](#9-cors)
-10. [CSRF](#10-csrf)
-11. [Rate limiting](#11-rate-limiting)
-12. [Security response headers](#12-security-response-headers)
-13. [Error handling and information leakage](#13-error-handling-and-information-leakage)
-14. [Actuator exposure](#14-actuator-exposure)
-15. [Request size limits](#15-request-size-limits)
-16. [Secrets management](#16-secrets-management)
-17. [Logging as a security control](#17-logging-as-a-security-control)
-18. [Java 17 language features used, and their Java 8 equivalents](#18-java-17-language-features-used-and-their-java-8-equivalents)
-19. [Decision summary table](#19-decision-summary-table)
+1. Password storage
+2. The authentication call chain
+3. Sessions vs JWT
+4. Inside a JWT
+5. Access and refresh tokens
+6. The filter chain
+7. Authorization and roles
+8. Resource ownership
+9. CORS
+10. CSRF
+11. Rate limiting
+12. Security response headers
+13. Error handling and what we refuse to say
+14. Actuator
+15. Request size limits
+16. Secrets
+17. Logging as a security tool
+18. Java 17 features used here
+19. Decision table
+20. Known gaps
 
 ---
 
 ## 1. Password storage
 
-### The problem
+### Why it matters
 
-If a database leaks — and eventually, somewhere, one does — the
-consequence should be "attacker has a pile of hashes to grind through,"
-not "attacker has everyone's password." Storing plaintext, or storing a
-plain unsalted hash, turns a data breach into a password breach for
-every account, including whatever other sites the same password is used
-on. Most people reuse passwords. This isn't a defense against a
-sophisticated attacker specifically targeting this app; it's a defense
-against the far more common case of a breach dump getting cross-checked
-against a hundred other sites.
+Sooner or later somebody's database leaks. Maybe it's yours, maybe it's a
+backup that ended up in the wrong bucket, maybe it's a SQL injection in code
+you didn't write. You can't promise it won't happen. What you can control is
+what the attacker is holding when it does.
+
+If passwords are stored in plain text, they're holding everyone's password,
+and people reuse passwords, so they're holding keys to a hundred other sites
+too. If passwords are hashed properly, they're holding a pile of puzzles that
+cost real money to solve one at a time. Same breach, very different day.
 
 ### What we built
 
-BCrypt, via `BCryptPasswordEncoder`:
+BCrypt, through Spring's `BCryptPasswordEncoder`:
 
 ```java
 @Bean
@@ -68,97 +71,76 @@ public PasswordEncoder passwordEncoder() {
 }
 ```
 
-BCrypt does two things a plain hash function (MD5, SHA-256, SHA-512)
-does not:
-
-- **It salts automatically.** Every call to `encode()` generates a fresh
-  random salt and embeds it in the output string. Two users with the
-  same password get completely different stored hashes. Without a salt,
-  an attacker can precompute a rainbow table once and use it against
-  every row in every leaked database that used the same hash function.
-- **It's deliberately slow, and the slowness is tunable.** BCrypt takes a
-  "cost factor" (`BCryptPasswordEncoder`'s default is 10, meaning 2^10
-  rounds). A fast hash like SHA-256 is *designed* to be fast — that's
-  perfect for checksumming a file, and terrible for password hashing,
-  because it means an attacker with a GPU can try billions of guesses
-  per second against a leaked hash. BCrypt costs milliseconds per guess
-  by design, which turns billions of guesses per second into thousands.
-
-The stored value looks like:
+The stored value looks like this:
 
 ```
 $2a$10$N9qo8uLOickgx2ZMRZoMye1J8O9pjLIcHkTIgtSJhYYKGxTKS0hqi
 ```
 
-Breaking that down: `$2a$` is the algorithm identifier, `10` is the cost
-factor, the next 22 characters are the salt, and the rest is the actual
-hash. All of that is stored together in one column — there's no separate
-"salt" column, because BCrypt's own format carries it.
+That string is packed with information. `$2a$` is the algorithm version.
+`10` is the cost factor, meaning 2^10 rounds of work. The next 22 characters
+are the salt, and the rest is the hash itself. Because the salt travels inside
+the string, there's no separate `salt` column to keep in sync, and no way to
+lose it.
 
-### Alternatives we considered
+Two properties make BCrypt right for passwords and SHA-256 wrong for them:
 
-**PBKDF2** (`Pbkdf2PasswordEncoder` in Spring Security). NIST-approved,
-FIPS-compliant, which matters if you're in a regulated industry that
-requires FIPS certification (BCrypt is not a NIST-approved algorithm).
-The tradeoff: PBKDF2's slowness comes purely from iteration count against
-a simple hash function, which means it's efficiently parallelizable on a
-GPU or ASIC. BCrypt's design is deliberately harder to parallelize on
-custom hardware. If you don't have a specific FIPS requirement, BCrypt or
-Argon2 are the more commonly recommended choices today.
+**It salts for you.** Every call to `encode()` generates a fresh random salt.
+Two users who both picked `hunter2` get completely different hashes. Without
+salts, an attacker precomputes one giant table of hash-to-password pairs and
+cracks every row of every database at once.
 
-**Argon2** (`Argon2PasswordEncoder`, needs the `bouncycastle` dependency
-in Spring Security). This is the winner of the 2015 Password Hashing
-Competition and is generally considered the strongest modern choice — it
-lets you tune not just CPU cost but *memory* cost, which makes GPU/ASIC
-cracking meaningfully harder than BCrypt (those devices have lots of
-compute but comparatively little fast memory per core). We didn't pick
-it mainly because BCrypt is the more battle-tested default in the Spring
-ecosystem, has zero extra dependencies (it's built into
-`spring-security-crypto`), and the marginal security gain over BCrypt for
-this project's threat model doesn't justify the extra dependency and
-tuning surface. For a new project today with no legacy constraint,
-Argon2 is a completely reasonable, arguably better, first choice.
+**It's slow on purpose.** SHA-256 is built to be fast, which is lovely for
+checksumming a file and terrible for passwords. A GPU can try billions of
+SHA-256 guesses a second. BCrypt makes each guess cost a few milliseconds, so
+billions per second becomes thousands. That's the entire trick: you can't make
+guessing impossible, but you can make it expensive enough to not be worth it.
 
-**SCrypt** (`SCryptPasswordEncoder`). Similar memory-hardness motivation
-to Argon2, older, less commonly recommended today than Argon2 specifically
-because Argon2 was designed partly in response to lessons learned from
-SCrypt. Not a wrong choice, just not the current best-practice default.
+There's a side effect you'll feel in development: a login takes noticeable
+time, and a `matches()` call is the heaviest thing in the request. That's the
+slowness working as designed. It's also why we cap password length at 72 bytes
+(more on that in section 15) and why rate limiting login matters (section 11):
+each attempt costs the server real CPU.
 
-**Rolling your own** (salt + SHA-256 by hand). Never do this. It's not
-that the concept is wrong, it's that "cost factor" and "resistance to
-custom hardware" are subtle enough that a hand-rolled version will almost
-certainly be weaker than any of the above, and there's no reason to take
-that risk when a correct, audited implementation is one dependency away.
+### What else we could have done
+
+**PBKDF2** (`Pbkdf2PasswordEncoder`). This is the one to pick if you need FIPS
+or NIST compliance, because BCrypt isn't on those lists. The tradeoff is that
+PBKDF2's slowness is only repeated hashing, which parallelizes well on GPUs
+and custom hardware. If nobody's forcing compliance on you, there are better
+options.
+
+**Argon2** (`Argon2PasswordEncoder`, needs BouncyCastle). The winner of the 2015
+Password Hashing Competition and honestly the strongest default today. It
+lets you tune memory cost as well as CPU cost, and memory is exactly what GPUs
+and ASICs are short on per core. If I were starting a brand new project with
+no history to respect, I'd seriously consider it. I stayed with BCrypt because
+it's built into `spring-security-crypto` with zero extra dependencies, it's what
+most Spring teams already know, and for this app's threat model the gap
+between the two isn't the thing that'll hurt us.
+
+**SCrypt.** Same memory-hard idea as Argon2, but older and generally
+considered superseded by it. Not wrong, just not the current best answer.
+
+**Rolling your own** (salt plus SHA-256 plus a loop). Please don't. The concept
+isn't wrong, the details are. Cost tuning and resistance to custom hardware are
+easy to get subtly wrong, and there's no upside when audited code is one
+dependency away.
 
 ### Java 17 vs Java 8
 
-This particular piece of code doesn't actually change between Java 8 and
-17 — `BCryptPasswordEncoder` has looked the same since Spring Security 4.
-The interesting difference is in how you'd typically *wire* the bean.
-
-Java 17, what we wrote:
-
-```java
-@Bean
-public PasswordEncoder passwordEncoder() {
-    return new BCryptPasswordEncoder();
-}
-```
-
-Java 8, functionally identical, no difference at all — this code
-predates most of the syntax features that changed. The one place Java 8
-would look different is if you wanted to build a small value object
-around a password check result. In Java 17 we'd reach for a record:
+The encoder wiring is identical on both. `BCryptPasswordEncoder` has looked
+the same since Spring Security 4. The only thing the JDK changes is the
+boilerplate around it. If you wanted a tiny value object for a check result,
+Java 17 gives you:
 
 ```java
-// Java 17
 public record PasswordCheckResult(boolean matches, boolean needsRehash) {}
 ```
 
-In Java 8, the same thing needs the full boilerplate:
+and Java 8 gives you this:
 
 ```java
-// Java 8
 public final class PasswordCheckResult {
     private final boolean matches;
     private final boolean needsRehash;
@@ -180,9 +162,7 @@ public final class PasswordCheckResult {
     }
 
     @Override
-    public int hashCode() {
-        return Objects.hash(matches, needsRehash);
-    }
+    public int hashCode() { return Objects.hash(matches, needsRehash); }
 
     @Override
     public String toString() {
@@ -191,50 +171,42 @@ public final class PasswordCheckResult {
 }
 ```
 
-Fourteen lines of boilerplate we don't have to write or maintain, purely
-because of the JDK version. This is the running theme in every Java 8
-comparison in this document: nothing about *security* changes, but the
-amount of code you have to read to find the security-relevant line goes
-up substantially.
+Nothing about *security* changed. You just have to read twenty lines to find
+the two that matter. That's the pattern you'll see in every Java 8 comparison
+in this document.
 
-### Where this is weak
+### Where it's still weak
 
-BCrypt's cost factor is currently whatever `BCryptPasswordEncoder`'s
-default is (strength 10 as of Spring Security 6.x). Hardware gets faster
-every year, and a cost factor that's appropriately slow today will be
-too fast in five years. Nobody has to remember to bump this manually —
-Spring Security has `DelegatingPasswordEncoder`, which stores the
-algorithm identifier as a prefix (`{bcrypt}$2a$10$...`) so you can
-upgrade the encoder later and still verify old hashes, then transparently
-re-hash them with the new encoder on next successful login. We are not
-currently using `DelegatingPasswordEncoder` — we inject
-`BCryptPasswordEncoder` directly. Worth revisiting if this project has a
-long lifespan.
+The cost factor is whatever Spring's default is (10 right now), and hardware
+only gets faster. A cost that's painful today is cheap in five years.
+Spring has `DelegatingPasswordEncoder` for exactly this: it prefixes each hash
+with its algorithm (`{bcrypt}$2a$...`), so you can switch encoders later and
+still verify old hashes, then quietly re-hash on next login. We inject
+`BCryptPasswordEncoder` directly instead, so we don't get that upgrade path
+for free. If this project lives long, that's worth changing.
 
 ---
 
 ## 2. The authentication call chain
 
-### The problem
+### Why it matters
 
-"Check if the password is right" sounds like a one-line `if` statement,
-and if you only ever need to check a password once, it basically is. The
-reason Spring Security's chain looks elaborate is that it's built to
-support many different *ways* of proving identity (password, LDAP, OAuth,
-a pre-authenticated header from a corporate SSO gateway...) through the
-same pluggable pipeline, without the application code needing to know or
-care which one is in play.
+"Check whether the password is right" sounds like one `if` statement, and for
+a single login method it basically is. The reason Spring Security looks like
+overkill is that it's built so the *same* pipeline can handle passwords, LDAP,
+OAuth, SSO headers and whatever else, without your controller knowing which one
+is in play. You pay for that flexibility up front, even if you only ever use one.
 
 ### What we built
+
+When `/api/auth/login` runs, this is what actually happens:
 
 ```
 AuthenticationManager.authenticate(token)
         ↓
-ProviderManager (the real implementation behind the interface)
+ProviderManager              (the real class behind the interface)
         ↓
-tries each registered AuthenticationProvider in order
-        ↓
-DaoAuthenticationProvider (ours)
+DaoAuthenticationProvider    (ours, registered as a bean)
         ↓
 UserDetailsServiceImpl.loadUserByUsername(email)
         ↓
@@ -243,277 +215,203 @@ UserRepository.findByEmail(email)
 PasswordEncoder.matches(rawPassword, storedHash)
 ```
 
-Each box has exactly one job:
+Each box has one job, and it helps to say it in plain words:
 
-- `AuthenticationManager` is the thing calling code talks to. It doesn't
-  know *how* authentication happens, only that it can hand off a request
-  and get back either a fully-authenticated `Authentication` or an
-  exception.
-- `ProviderManager` is the concrete class Spring gives you when you ask
-  for an `AuthenticationManager` bean. It holds a *list* of
-  `AuthenticationProvider`s and tries each one until one succeeds or all
-  of them fail. We only ever register one (`DaoAuthenticationProvider`),
-  but the design supports many — e.g. you could add an LDAP provider
-  alongside the database one, and a login attempt would try both.
-- `DaoAuthenticationProvider` is the provider that knows the specific
-  recipe "look the user up via `UserDetailsService`, then check the
-  password via `PasswordEncoder`." "Dao" here means Data Access Object —
-  it's the provider that talks to a data source, as opposed to, say, an
-  LDAP-specific provider.
-- `UserDetailsService` is the seam between Spring Security's generic
-  world and our specific `User` entity. It has one method:
-  `loadUserByUsername(String)`. We called it with an email, not a
-  "username," because we don't have separate usernames — Spring
-  Security's interface uses the word "username" generically to mean
-  "whatever your unique identifier is."
+- **`AuthenticationManager`** is the front desk. Your code hands it credentials
+  and gets back either a verified identity or an exception. It doesn't know or
+  care how the checking happens.
+- **`ProviderManager`** is what you actually get when you ask for an
+  `AuthenticationManager` bean. It keeps a list of providers and tries each one
+  until somebody succeeds. We register exactly one, but you could add an LDAP
+  provider next to it and logins would try both.
+- **`DaoAuthenticationProvider`** knows one recipe: look the user up through a
+  `UserDetailsService`, then compare passwords with a `PasswordEncoder`. "Dao"
+  just means it talks to a data source.
+- **`UserDetailsService`** is the seam between Spring Security's world and our
+  `User` entity. One method. It says "username", but it just means "whatever
+  uniquely identifies a user", which for us is an email.
 
-### Alternatives we considered
+One subtle behavior worth knowing, because it'll confuse you while debugging:
+if the email doesn't exist, `DaoAuthenticationProvider` internally throws
+`UsernameNotFoundException`, then converts it into `BadCredentialsException`
+before it reaches you. That's on by default (`hideUserNotFoundExceptions`) and
+it's deliberate. An attacker should get the same failure for "no such user" and
+"wrong password". You'll never see the user-not-found case surface at the
+controller, and that's the feature working.
 
-**Skip `AuthenticationManager` entirely and check the password by hand
-in the controller:**
+### What else we could have done
+
+**Skip all of it and check by hand in the controller:**
 
 ```java
-// what we did NOT do
 User user = userRepository.findByEmail(email).orElseThrow(...);
 if (!passwordEncoder.matches(rawPassword, user.getPasswordHash())) {
     throw new BadCredentialsException("bad password");
 }
 ```
 
-This would actually *work* for a project this size. It's fewer moving
-parts, and for a genuinely simple app with exactly one way to log in and
-no plans to ever add another, it's a defensible choice — you lose
-nothing functionally. The reasons we didn't do this: first, going through
-`AuthenticationManager` means `SecurityContextHolder` gets populated with
-a real, correctly-typed `Authentication` object that carries authorities
-— if we set that up by hand, it's easy to forget a detail (like
-authorities) that a filter or `@PreAuthorize` check later depends on.
-Second, and more relevant to why this project does it the "long way":
-the whole point here is demonstrating what a real Spring Security setup
-looks like, so a reader can drop in LDAP, OAuth, or SSO later along the
-grain of the framework's design, not against it.
+This genuinely works, and for a tiny app with one login method and no plans for
+a second, it's a defensible choice. We didn't, for two reasons. Going through
+`AuthenticationManager` hands you a properly built `Authentication` with
+authorities attached, and doing that by hand is how you forget the authorities
+and wonder why a role check fails later. And this repo is meant to show what a
+real setup looks like, so someone can add LDAP or SSO later along the grain of
+the framework instead of fighting it.
 
-**Custom `AuthenticationProvider` implementing everything by hand**
-(skip `UserDetailsService` + `DaoAuthenticationProvider`, write one class
-that does both jobs). Also workable. The reason to keep them separate is
-reuse: `UserDetailsService` is also what a JWT filter or a "current user"
-helper can lean on later without duplicating the "how do I load a user"
-logic. Collapsing it into one provider class means every future consumer
-either depends on that provider (awkward — providers are meant to be used
-by the authentication manager, not called directly) or duplicates the
-lookup.
+**One custom provider that does lookup and check in a single class.** Also
+fine. We kept `UserDetailsService` separate because other code wants it too:
+the JWT filter loads users through it. Merge it into a provider and either
+that filter depends on a class never meant to be called directly, or the lookup
+logic gets copy-pasted.
 
 ### Java 17 vs Java 8
 
-The provider/service classes themselves are plain classes implementing
-interfaces — no real syntax difference. Where it does matter is
-`UserDetailsImpl`, which implements Spring Security's `UserDetails`
-interface with five boolean methods that basically never return anything
-but `true` for us:
+Nothing changes in the provider or service classes. They implement interfaces
+and are plain classes either way.
 
-Java 17 (what we wrote):
+`UserDetailsImpl` is where people expect Java 17 to help and it doesn't. It
+implements `UserDetails`, which has methods like `isAccountNonExpired()` that
+we all answer with `return true;`:
 
 ```java
-@Override
-public boolean isAccountNonExpired() { return true; }
-
-@Override
-public boolean isAccountNonLocked() { return true; }
-
-@Override
-public boolean isCredentialsNonExpired() { return true; }
-
-@Override
-public boolean isEnabled() { return true; }
+@Override public boolean isAccountNonExpired()     { return true; }
+@Override public boolean isAccountNonLocked()      { return true; }
+@Override public boolean isCredentialsNonExpired() { return true; }
+@Override public boolean isEnabled()               { return true; }
 ```
 
-This is identical in Java 8 — nothing modern here to simplify, since
-these are trivial one-line method bodies either way. Where Java 17 does
-help is in the constructor and equality-adjacent boilerplate if you
-wanted `UserDetailsImpl` itself to be a value-style object; but because
-it has to *implement an interface with many methods*, it can't be a
-`record` (a record can implement interfaces, but `UserDetails` has five
-methods beyond the constructor-derived ones, so you'd still write them
-all out by hand regardless of Java version). This is a case where the
-Java 17 feature set doesn't actually help — worth noting, because it's
-not true that "newer Java always means less code."
+Same on Java 8. A `record` can implement an interface, but it still has to
+spell out every interface method, so there's nothing to save. It's worth
+knowing that "newer Java" doesn't always mean "less code".
 
-### Where this is weak
+### Where it's still weak
 
-We only ever register one `AuthenticationProvider`. If a login request's
-email doesn't exist, `DaoAuthenticationProvider` throws
-`UsernameNotFoundException` internally, which Spring Security by default
-converts to the same `BadCredentialsException` a wrong password would
-throw — this is intentional (see section 13 on error handling), not a
-bug. Worth knowing if you're debugging and wondering why a "user not
-found" case never surfaces as its own distinct exception type at the
-controller.
+We only register one provider, and `isAccountNonLocked()` always returns `true`.
+That's honest today because we have no lockout feature, but the hook is there
+if you add one: return `false` from that method and Spring will refuse the login
+for you, with the right exception type.
 
 ---
 
-## 3. Sessions vs JWT — the actual tradeoff
+## 3. Sessions vs JWT
 
-### The problem
+### Why it matters
 
-HTTP is stateless. Once you've verified a password on request 1, request
-2 arrives with no memory of request 1 unless something carries identity
-forward between them. There are exactly two broad families of solution:
-the server remembers (sessions), or the client carries proof with every
+HTTP forgets you between requests. You prove who you are on request 1, and
+request 2 shows up with no memory of that. Everything in this section is about
+what carries your identity forward. There are really only two families of
+answer: the server remembers you (sessions), or you carry proof with every
 request (tokens).
 
 ### What we built, and why in that order
 
-We built sessions first, then JWT, on purpose — not because sessions
-were a mistake, but because understanding the traditional model makes it
-obvious *why* JWT exists and what it trades away. The full writeup is in
-`docs/adr/001-session-vs-jwt.md`; here's the expanded version.
+I built sessions first on purpose. Not because they were a mistake, but
+because it's the clearest way to see what JWT trades away. (The short decision
+record is in `docs/adr/001-session-vs-jwt.md`. This is the long version.)
 
-**Session model:**
-
-```
-login → server creates a session, stores Authentication in it,
-        server generates a random session ID, sends it as a cookie
-next request → browser automatically attaches the cookie
-             → server looks up the session ID in its store
-             → finds the Authentication, request proceeds
-```
-
-The server is doing real work here: it's holding state, in memory or in
-an external store, for every logged-in user, for as long as their
-session lasts. The browser does almost nothing special — cookie handling
-is automatic, which is actually a security feature (see CSRF, section
-10, for the flip side of that "automatic" behavior).
-
-**JWT model:**
+**Sessions:**
 
 ```
-login → server verifies credentials, builds a signed token containing
-        the claims (who you are, when it expires), sends it back as
-        a plain string in the response body
-next request → CLIENT deliberately attaches it, usually in an
-             Authorization header
-             → server verifies the signature and expiry — no lookup
-               anywhere, the token carries its own proof
+login   → server stores your Authentication in a session,
+          sends you a random session ID in a cookie
+request → browser attaches the cookie by itself
+        → server looks the ID up, finds your Authentication, carries on
 ```
 
-The server holds nothing. Verifying a JWT is pure computation (check a
-cryptographic signature, check a timestamp) — no database call, no
-shared session store, no state at all. This is what "stateless" means in
-this context, and it's the entire reason JWT plays nicely with multiple
-backend instances behind a load balancer: any instance can verify any
-token, because verification doesn't depend on which instance issued it
-or any state that instance is holding.
+The server is doing real work: holding state for every logged-in user for as
+long as the session lives. The browser does almost nothing, because cookie
+handling is automatic. That automatic part is a security win in one way (see
+HttpOnly below) and a security risk in another (see CSRF, section 10).
 
-### Alternatives we considered
+**JWT:**
 
-**Sticky sessions** (a load balancer configured to always route a given
-user's requests to the same backend instance, keyed on their session
-cookie). This would let us keep sessions *and* scale horizontally.
-Real projects do this. The reasons we didn't: it couples your
-infrastructure layer to a specific routing strategy (if that instance
-goes down, everyone stuck to it loses their session), and it doesn't
-solve the cross-origin cookie friction of a separately-hosted frontend
-(Vercel) and backend (Render), which was the actual deciding factor for
-this project.
+```
+login   → server verifies credentials, builds a signed token, returns it as a string
+request → the CLIENT attaches it, usually in an Authorization header
+        → server verifies the signature and expiry. No lookup, no state.
+```
 
-**Externalized session store** (Spring Session + Redis). Keep the
-session *model* — cookie-based, server remembers — but move the "server
-remembers" part into a shared Redis instance every backend instance can
-read. This genuinely solves the multi-instance problem while keeping
-`HttpOnly` cookies (a real security advantage over JWT — more below).
-This is a legitimate, arguably *better* choice than JWT for many
-projects, and we call this out explicitly in `ARCHITECTURE.md`. We didn't
-build it here because it adds Redis as a new piece of infrastructure, and
-part of this project's goal was demonstrating JWT specifically as a
-learning exercise. If you're using this repo as a base for a real project
-with a same-origin frontend, Spring Session + Redis is genuinely worth
-evaluating before reaching for JWT by default.
+Verifying a JWT is pure computation: check a signature, check a clock. No
+database call, no shared session store, nothing remembered. That's what
+"stateless" means here, and it's the whole reason JWT plays nicely when you
+run several backend instances behind a load balancer. Any instance can verify
+any token, because verification doesn't depend on which one issued it.
 
-**Opaque tokens** (a random string, not a JWT, stored server-side —
-functionally a session, just delivered like a bearer token instead of a
-cookie). This gets you the "attach it manually via header, no cookie
-friction" benefit of JWT while keeping the "server can instantly revoke
-it" benefit of sessions (with a JWT, revoking a specific token before its
-natural expiry requires extra infrastructure — see section 5 on refresh
-tokens for how we partially solved this). The tradeoff is you're back to
-a database or cache lookup on every request, i.e., you've given up
-statelessness. Some real systems use opaque *access* tokens with short
-lifetimes specifically to get revocability, while accepting the lookup
-cost. Worth knowing this exists as a middle ground.
+### What else we could have done
 
-### The concrete disadvantages of JWT we're accepting
+**Sticky sessions.** Configure the load balancer to always send you to the same
+instance. Real teams do this. The catch is that you've welded your
+infrastructure to a routing rule, and if that instance dies, everyone stuck
+to it is logged out. It also doesn't fix the cross-origin cookie headaches of a
+separate frontend and backend, which is what actually decided it for us.
 
-Being honest about what we gave up:
+**Spring Session with Redis.** Keep the session model, but store sessions in a
+shared Redis so every instance can read them. This really does solve
+multi-instance scaling *and* keeps `HttpOnly` cookies. Honestly, for a
+same-origin app this is often the better answer than JWT, and I'd want you to
+evaluate it before reaching for JWT by default. We didn't build it because it
+adds Redis to the stack and one goal here was demonstrating JWT.
 
-1. **No instant revocation.** Once issued, a JWT is valid until it
-   expires, full stop — the server can't reach out and un-issue it. Our
-   1-hour access token expiry is the mitigation: worst case, a stolen
-   token is usable for up to an hour. This is why the expiry is short.
-   Refresh tokens (section 5) get a real revocation mechanism because we
-   deliberately made *them* stateful (stored in the database), which is
-   a bit of an admission that pure statelessness isn't actually what we
-   want everywhere — just for the high-frequency access-token path.
+**Opaque tokens.** A random string, stored server-side, sent as a bearer token.
+You get "attach it manually, no cookie friction" like JWT, and "server can
+kill it instantly" like a session. The price is a lookup on every request,
+so you've given up statelessness. Some systems use short-lived opaque access
+tokens specifically for the instant revocation. It's a real middle path.
 
-2. **No `HttpOnly` protection.** A cookie can be marked `HttpOnly`,
-   meaning JavaScript running on the page literally cannot read it — even
-   if an attacker manages to inject a malicious script (XSS), they can't
-   steal an `HttpOnly` cookie via `document.cookie`. A JWT held in
-   `localStorage` or a JS variable (which is how a frontend typically
-   has to store it, since it needs to read the token to attach it to
-   requests) is fully readable by any script running on the page,
-   including an injected one. This means our security model is now
-   leaning more heavily on "don't have an XSS vulnerability in the
-   frontend" than a cookie-based session would have needed to.
+### What we gave up by choosing JWT
 
-3. **Larger request size.** A session cookie is just an opaque ID,
-   typically under 40 bytes. A JWT carries its claims and a signature —
-   ours run a few hundred bytes. Not a real problem at our scale, just
-   worth knowing the numbers aren't equivalent.
+I want to be straight about this, because tutorials tend to skip it.
+
+1. **No instant revocation.** Once issued, a JWT is good until it expires. The
+   server can't reach out and cancel it. Our mitigation is a short lifetime
+   (1 hour). Refresh tokens (section 5) are stateful on purpose, so *they* can be
+   revoked. That's a quiet admission that pure statelessness isn't what we
+   actually want everywhere.
+
+2. **No `HttpOnly`.** A cookie can be marked so JavaScript can't read it, which
+   means even an injected script can't steal it. A JWT held in `localStorage`
+   or a variable is readable by any script on the page. So we've shifted risk
+   onto "don't have an XSS hole in the frontend", which is a heavier thing to
+   promise than it sounds.
+
+3. **Bigger requests.** A session cookie is a ~32-byte ID. Our JWT is a few
+   hundred bytes on every request. Irrelevant at our scale, just not free.
 
 ### Java 17 vs Java 8
 
-`SessionCreationPolicy.STATELESS` is a plain enum constant — identical
-in both versions. The more interesting comparison is the ADR document
-itself, which in a Java 8 codebase might well have been a Confluence page
-instead of a markdown file in the repo — not a language difference, but
-a cultural one worth naming: putting ADRs in the repo, versioned
-alongside the code they justify, is a practice that got much more common
-during the same years Java itself was modernizing. Nothing stops you from
-doing it on Java 8; it's just not a `pom.xml` line, it's a habit.
+`SessionCreationPolicy.STATELESS` is an enum constant. Identical everywhere.
+The only comparison worth making is cultural: keeping an ADR in the repo,
+versioned next to the code it justifies, is a habit that spread during the same
+years Java was modernizing. You can do it on Java 8 just fine. It's a
+convention, not a `pom.xml` line.
 
-### Where this is weak
+### Where it's still weak
 
-We chose JWT because of our *anticipated* deployment shape (separate
-frontend origin, possible multi-instance scaling) — not because we ever
-actually measured a real need. If this project stayed as a single
-instance with a browser-rendered, same-origin frontend, sessions would
-have been simpler and arguably more secure by default (the `HttpOnly`
-point above). Worth re-litigating this decision if the deployment
-assumptions change.
+We picked JWT because of the deployment we *expect* (separate frontend origin,
+maybe several instances), not one we measured. If this stayed a single instance
+with a same-origin frontend, sessions would have been simpler and arguably
+safer by default. If those assumptions change, re-open this decision.
 
 ---
 
-## 4. JWT structure and signing
+## 4. Inside a JWT
 
-### The problem
+### Why it matters
 
-Once you've decided to hand the client a token instead of a cookie, you
-need a format the client can carry around as an opaque string, and a way
-for *any* backend instance to verify — without a database call — that
-the token wasn't forged or tampered with.
+Once you hand the client a token instead of a cookie, you need a format they
+can carry as an opaque string, and a way for any instance to verify it wasn't
+forged or edited without calling a database.
 
 ### What we built
 
-A JWT is three base64url-encoded segments separated by dots:
-`header.payload.signature`. Decode the header and payload of any JWT (at
-jwt.io, for example) and you can read them in plain text — **a JWT is
-signed, not encrypted.** This is worth repeating because it surprises
-people: anyone who intercepts a JWT can read every claim inside it
-without needing the secret. The secret only proves the token wasn't
-*altered* since it was issued. Never put a password, a credit card
-number, or anything else sensitive into a JWT's claims.
+A JWT is three base64url chunks joined by dots: `header.payload.signature`.
+Paste any JWT into jwt.io and you'll read the first two in plain text.
 
-Our token's payload, decoded:
+> **Heads up:** a JWT is *signed*, not *encrypted*. Anyone who gets hold of it
+> can read every claim. The secret only proves nobody *changed* it. Never put a
+> password, a card number or anything private in the claims.
+
+Ours decodes to:
 
 ```json
 {
@@ -526,554 +424,402 @@ Our token's payload, decoded:
 }
 ```
 
-- `sub` (subject) — who this token represents. We use email since it's
-  our unique identifier.
-- `iss` (issuer) — which system minted this token. Meaningful mainly once
-  more than one system could theoretically issue tokens under the same
-  secret; harmless to include now, and jjwt lets us call
-  `.requireIssuer(...)` during validation for free hardening.
-- `jti` (JWT ID) — a unique identifier for this specific token. This is
-  what makes refresh token revocation possible (section 5) — we can't
-  revoke "the JWT" itself (no server-side state, remember), but we can
-  mark *this jti* as revoked in our own database and check it.
-- `type` — not a standard JWT claim, ours, custom. Distinguishes an
-  access token from a refresh token so one can't be used in place of the
-  other.
-- `iat` / `exp` — issued-at and expiration, standard claims, both Unix
-  timestamps (seconds since epoch).
+What each claim is doing for us:
 
-Signing:
+- **`sub`**: who the token is about. We use the email, since that's our unique
+  identifier and the same thing `UserDetailsServiceImpl` looks up.
+- **`iss`**: who minted it. With one backend this feels pointless, but we
+  enforce it on validation (`requireIssuer`), which costs nothing and means a
+  validly-signed token from some other system sharing a secret won't pass.
+- **`jti`**: a unique ID for *this* token. It looks like decoration until you
+  need to revoke one specific refresh token. You can't un-issue a JWT, but you
+  can mark its `jti` revoked in your own table and check it.
+- **`type`**: ours, not standard. It says ACCESS or REFRESH, so one can never
+  be passed off as the other.
+- **`iat` / `exp`**: issued-at and expiry, as Unix seconds.
+
+Signing is two lines:
 
 ```java
 this.signingKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
 // ...
-Jwts.builder()
+Jwts.builder().subject(email) /* ... */ .signWith(signingKey).compact();
+```
+
+`hmacShaKeyFor` builds a symmetric key: the same secret signs and verifies.
+jjwt picks the algorithm from the key length, so 32+ bytes gives HS256, 48+
+gives HS384, and 64+ gives HS512.
+
+> **Practical gotcha:** jjwt 0.12 refuses keys shorter than 256 bits and throws
+> `WeakKeyException` at startup. If your app dies on boot after you set a short
+> `JWT_SECRET`, that's why. Use `openssl rand -base64 32` and move on.
+
+### What else we could have done
+
+**Asymmetric signing (RS256, ES256).** A private key signs and a public key
+verifies, and you can hand the public key to anyone. That matters when several
+services need to *check* tokens but only one should be able to *issue* them.
+We have one process that does both, so symmetric is simpler and faster. If this
+ever splits into services, this is the first thing to revisit.
+
+**Nimbus JOSE + JWT** instead of jjwt. Nimbus is more complete (it does full
+JOSE, including encrypted JWE tokens) and it's what Spring's own OAuth2
+resource server uses underneath. jjwt has a friendlier fluent API, which is why
+I picked it for a repo people are supposed to read. If you ever need encrypted
+tokens, move to Nimbus.
+
+**Auth0's `java-jwt`.** Similar spirit to jjwt. No strong reason to prefer one.
+
+**PASETO.** A newer format designed to remove JWT's footguns, most famously the
+`alg: none` attack, where sloppy verifiers trusted the algorithm named *inside*
+the token and accepted unsigned ones. We're not exposed to that, because we
+always supply and enforce the verification key ourselves instead of trusting
+whatever the token claims. PASETO removes the whole bug class by design, but JWT
+has far better tooling and support, so we stayed.
+
+### Java 17 vs Java 8
+
+Here's the real code:
+
+```java
+// Java 17, jjwt 0.12 fluent API
+return Jwts.builder()
         .subject(subjectEmail)
-        // ...
+        .issuer(ISSUER)
+        .id(jti)
+        .claim(CLAIM_TOKEN_TYPE, type.name())
+        .issuedAt(now)
+        .expiration(expiry)
         .signWith(signingKey)
         .compact();
 ```
 
-`Keys.hmacShaKeyFor` builds a symmetric key from our raw secret bytes.
-"Symmetric" means the same key both signs and verifies — whoever has the
-secret can do both. jjwt auto-selects HMAC-SHA256 (HS256) for a key of
-our length.
-
-### Alternatives we considered
-
-**Asymmetric signing (RS256/ES256 — RSA or elliptic curve).** With
-asymmetric signing, you have a private key (signs tokens) and a public
-key (verifies them), and you can hand out the public key freely — a
-separate service can verify tokens without ever being trusted to *issue*
-them, because it physically can't (it only has the public half). This
-matters in a microservices architecture where, say, five different
-services all need to verify tokens but only one auth service should be
-able to mint them. For this project, exactly one process both issues and
-verifies every token, so there's no separation-of-trust problem to solve
-— symmetric HMAC is simpler, faster to compute, and appropriate. If this
-project ever splits into multiple services, this is the first thing to
-revisit.
-
-**A different JWT library.** We used `io.jsonwebtoken` (jjwt). The other
-mainstream choice on the JVM is Nimbus JOSE + JWT
-(`com.nimbusds:nimbus-jose-jwt`), which is more feature-complete (full
-JOSE/JWE support — encrypted tokens, not just signed ones) and is what
-Spring Security's own OAuth2 resource server support uses internally.
-jjwt has a noticeably more approachable, fluent builder API
-(`Jwts.builder().subject(...).signWith(...)`), which is why we picked it
-for a project meant to be read and understood, not necessarily the
-"more powerful" choice. If you ever need encrypted tokens (JWE, not
-just signed JWS, which is what we have), Nimbus is the more natural fit.
-
-**Auth0's `java-jwt`.** Another common choice, similar in spirit to jjwt.
-No strong reason to prefer one over the other for a project this size;
-jjwt's version-0.12 fluent API tipped the choice.
-
-**PASETO** (Platform-Agnostic Security Tokens) — a newer alternative to
-JWT designed specifically to remove footguns that JWT allows, most
-famously the "alg: none" vulnerability, where some poorly-implemented
-JWT verifiers could be tricked into accepting a token with no signature
-at all because the algorithm is specified *inside the token itself* and
-some libraries trusted it blindly. jjwt, and Spring Security's tooling
-generally, are not vulnerable to this specific issue when used correctly
-(we always specify and enforce the verification key/algorithm
-ourselves rather than trusting whatever the token claims), but PASETO
-removes the class of bug entirely by design. We stuck with JWT because
-it's the far more widely supported standard with better tooling and
-documentation, and the specific vulnerability class is a solved problem
-as long as you don't let the library trust the token's self-declared
-algorithm — which we don't.
-
-### Java 17 vs Java 8
-
-This is one of the more visible differences in the whole project. Here's
-our actual token-building code:
+And what you'd see in a typical Java 8-era project, which means jjwt 0.9.x:
 
 ```java
-// Java 17 — what we wrote
-private String buildToken(String subjectEmail, long expirationMs, TokenType type, String jti) {
-    Date now = new Date();
-    Date expiry = new Date(now.getTime() + expirationMs);
-
-    return Jwts.builder()
-            .subject(subjectEmail)
-            .issuer(ISSUER)
-            .id(jti)
-            .claim(CLAIM_TOKEN_TYPE, type.name())
-            .issuedAt(now)
-            .expiration(expiry)
-            .signWith(signingKey)
-            .compact();
-}
+return Jwts.builder()
+        .setSubject(subjectEmail)
+        .setIssuer(ISSUER)
+        .setId(jti)
+        .claim(CLAIM_TOKEN_TYPE, type)
+        .setIssuedAt(now)
+        .setExpiration(expiry)
+        .signWith(SignatureAlgorithm.HS256, secretKeyBytes)
+        .compact();
 ```
 
-On Java 8, jjwt's API itself was different (this is the 0.9.x-era API,
-before the fluent builder redesign) — Java 8 predates jjwt 0.12, so a
-Java 8 project would typically be using jjwt 0.9.x or 0.11.x with the
-older method names:
+Spot the difference: `setSubject` vs `subject`, and the algorithm named as a
+separate argument. That isn't a Java change, it's jjwt's API evolving. It's also
+exactly the bug we hit earlier in this project: the `.subject()` code pasted
+against a 0.11.5 dependency, where the method doesn't exist yet. Copying code
+between tutorials written years apart is the usual way to get bitten.
+
+The language-level difference is the small `IssuedToken` carrier:
 
 ```java
-// Java 8 — jjwt 0.9.x era API (also valid on Java 17, just older style)
-public String buildToken(String subjectEmail, long expirationMs, String type, String jti) {
-    Date now = new Date();
-    Date expiry = new Date(now.getTime() + expirationMs);
-
-    return Jwts.builder()
-            .setSubject(subjectEmail)
-            .setIssuer(ISSUER)
-            .setId(jti)
-            .claim(CLAIM_TOKEN_TYPE, type)
-            .setIssuedAt(now)
-            .setExpiration(expiry)
-            .signWith(SignatureAlgorithm.HS256, secretKeyBytes)
-            .compact();
-}
+public record IssuedToken(String token, Instant expiresAt) {}   // Java 17
 ```
 
-Notice `setSubject` vs `subject`, `setIssuer` vs `issuer` — this is
-jjwt's own API evolution, not a Java language feature, but it's exactly
-the kind of thing that bites people copying code from different
-tutorials written years apart (this is literally the bug we hit earlier
-in this project — pasted code using the 0.12 fluent API against a
-0.11.5 dependency in the pom, and `.subject()` didn't exist yet). Also
-note `signWith(SignatureAlgorithm.HS256, secretKeyBytes)` — older jjwt
-needed you to name the algorithm explicitly as a separate parameter;
-`Keys.hmacShaKeyFor(...)` combined with the newer `signWith(Key)`
-overload lets the library infer the right algorithm from the key's
-length and type instead.
+On Java 8 that's a final class with two fields, a constructor, two accessors and
+the usual `equals`/`hashCode`/`toString`. And note that `java.time.Instant` is
+Java 8 already, so our time handling reads the same on both. The `Date` objects
+you see around jjwt are there because jjwt's API wants `java.util.Date`, not
+because of a JDK limit.
 
-Where actual Java *language* version matters: `TokenType` is a Java enum
-in both versions, unchanged. But the `record` we use for
-`IssuedToken`:
+### Where it's still weak
 
-```java
-// Java 17
-public record IssuedToken(String token, Instant expiresAt) {}
-```
-
-On Java 8, the same thing:
-
-```java
-// Java 8
-public final class IssuedToken {
-    private final String token;
-    private final Instant expiresAt;
-
-    public IssuedToken(String token, Instant expiresAt) {
-        this.token = token;
-        this.expiresAt = expiresAt;
-    }
-
-    public String token() { return token; }
-    public Instant expiresAt() { return expiresAt; }
-
-    @Override
-    public boolean equals(Object o) { /* ... */ }
-    @Override
-    public int hashCode() { /* ... */ }
-    @Override
-    public String toString() { /* ... */ }
-}
-```
-
-Also worth mentioning: Java 8's `java.time` package (`Instant`, `Date`
-conversions) is actually already modern — `java.time` shipped *in* Java
-8, replacing the old `java.util.Date`/`Calendar` mess. So our use of
-`Instant` throughout this project would look identical on Java 8. The
-`Date` objects you see in the JWT-building code above exist only because
-jjwt's API itself expects `java.util.Date`, not because of any Java
-version constraint — that's a library API choice, not a language one.
-
-### Where this is weak
-
-The secret is a single, static string, loaded once at startup, used for
-the lifetime of the process. There's no key rotation mechanism — if the
-secret is ever compromised, every token ever issued (until natural
-expiry) remains valid and forgeable, and rotating the secret would
-invalidate every currently-logged-in user's session simultaneously
-(a real, if rare, operational event). A more mature setup uses a `kid`
-(key ID) claim in the JWT header and supports multiple valid signing
-keys simultaneously, so you can introduce a new key, let old tokens
-expire naturally, and retire the old key without a flag day. Not built
-here — genuinely more infrastructure than this project's current scope
-justifies, but worth knowing the gap exists.
+One static secret, loaded once, valid forever. There's no key rotation. If the
+secret leaks, every token ever issued is forgeable until natural expiry, and
+rotating the secret logs everyone out at once. Mature setups put a `kid` (key
+ID) in the JWT header and accept several keys at the same time, so you can
+introduce a new one, let old tokens age out, and retire the old key without a
+flag day. We didn't build that. It's more machinery than this project's current
+scope earns, but you should know the gap exists.
 
 ---
 
-## 5. Access + refresh tokens
+## 5. Access and refresh tokens
 
-### The problem
+### Why it matters
 
-Short-lived tokens are safer (a stolen one has a small blast radius) but
-annoying (users get logged out constantly). Long-lived tokens are
-convenient but dangerous if stolen. The standard resolution: use both. A
-short-lived access token for every actual API call, and a long-lived
-refresh token whose only job is "trade me for a new access token,"
-presented far less often and specifically revocable.
+Short-lived tokens are safer, since a stolen one dies quickly, but they're
+annoying: users get kicked out constantly. Long-lived tokens are comfortable
+and dangerous. The usual way out is to use both: a short-lived access token
+for real API calls, and a long-lived refresh token whose only job is "trade me
+for a new access token". It shows up rarely, and it can be revoked.
 
 ### What we built
 
 ```
-login → access token (1 hour) + refresh token (14 days, persisted server-side by jti)
-access token expires → client calls /api/auth/refresh with the refresh token
-                     → server checks it's a REFRESH-type token, checks the
-                       jti hasn't been revoked
-                     → issues a NEW access+refresh pair
-                     → OLD refresh token is revoked (rotation)
+login          → access token (1 hour) + refresh token (14 days, stored by jti)
+access expires → client POSTs the refresh token to /api/auth/refresh
+               → server checks it's REFRESH-type and its jti isn't revoked
+               → issues a NEW pair, revokes the OLD refresh token (rotation)
 ```
 
-Rotation is the important design choice here: a refresh token can only
-ever be used once. If it's used a second time, we know something is
-wrong — either the legitimate user's token was already rotated (normal),
-or someone is replaying a stolen token after the real user already moved
-past it (an attack). We currently just reject the reuse; we don't yet
-escalate to "revoke this whole token family" (see "where this is weak,"
-below).
+Rotation is the interesting part. A refresh token works exactly once. If it's
+ever presented a second time, something's off: either it's an honest retry
+after a network glitch, or someone is replaying a stolen token after the real
+user already moved past it. Today we just reject the second use.
 
-### Alternatives we considered
+The refresh token is also persisted, but only by `jti`. We never store the
+token itself, because the signature already proves it's genuine. The table's
+only job is answering "has this specific ID been used or revoked?"
 
-**No refresh tokens at all — just re-login on access token expiry.**
-Genuinely the right choice for a lot of apps, especially ones where an
-hour-long session is fine (an internal tool, an app people check briefly
-and close). We built refresh tokens because we decided — deliberately,
-not reflexively — that requiring a password re-entry every hour was a
-real UX problem for this project's intended use case (a workspace app
-people keep open all day). If your use case doesn't have that problem,
-skip this entirely; it's real complexity (a whole extra table, an extra
-endpoint, a cleanup job) for a real but specific benefit.
+### What else we could have done
 
-**Sliding-expiration single token** (no separate refresh token; every
-successful API call extends the same token's expiry). Simpler — one
-token type, no rotation logic. The downside: it makes "log out" and
-"force expiry" much harder to reason about, since the token is
-continuously extending itself, and it means every single request
-(not just the periodic refresh) needs write access to wherever expiry
-is tracked, if you want that state persisted rather than purely
-client-trusted.
+**No refresh tokens at all.** Re-login when the access token expires. This is
+the right call for a lot of apps, especially internal tools that people open
+briefly. We built refresh tokens because I decided, on purpose, that typing a
+password every hour was a real UX problem for an app people keep open all day.
+If you don't have that problem, skip all of this: it's a table, an endpoint
+and a cleanup job for a specific benefit.
 
-**Refresh token as an opaque random string, not a JWT.** We generate a
-`jti` (a UUID) either way and store it — the fact that our refresh token
-*also* happens to be a full JWT (with its own signature, subject, and
-expiry claim) is somewhat redundant, since we already look it up by
-`jti` in the database on every use, which means the database round-trip
-is the actual source of truth, not the JWT's own embedded expiry. A
-simpler design would make the refresh token just be a random opaque
-string (like a session ID), stored directly, with no JWT machinery at
-all for this half of the pair. We used a JWT for consistency with the
-access token's `JwtService`, but it's fair to call this slightly
-over-engineered for what the refresh token actually needs to do.
+**One sliding token.** Every request extends the same token's expiry. Fewer
+moving parts, but "log out" and "force expiry" become very hard to reason
+about, and if you persist the expiry, every request becomes a write.
+
+**An opaque refresh token instead of a JWT.** Honestly, our refresh token being
+a full JWT is slightly redundant. We look it up by `jti` in the database on
+every use anyway, so the database is the real source of truth, not the
+embedded expiry. A random string would do the job. I used a JWT for symmetry
+with the access token and to reuse `JwtService`, but it's fair to call that a bit
+over-engineered.
 
 ### Java 17 vs Java 8
 
-The `RefreshToken` entity is a plain JPA `@Entity` — identical
-regardless of Java version, since JPA annotations predate both. The one
-place worth showing is the claims-extraction code using pattern matching
-for `instanceof`, a genuine Java 17 (technically Java 16+) feature:
+The `RefreshToken` entity is a plain JPA class, identical on both. The place
+the JDK shows up is exception handling, where we walk cause chains:
 
 ```java
-// Java 17 — pattern matching for instanceof
+// Java 17, pattern matching for instanceof
 if (t instanceof SQLException sqlEx) {
     sqlState = sqlEx.getSQLState();
 }
 ```
 
 ```java
-// Java 8 — the cast is separate and manual
+// Java 8, test then cast
 if (t instanceof SQLException) {
     SQLException sqlEx = (SQLException) t;
     sqlState = sqlEx.getSQLState();
 }
 ```
 
-Small difference, but it appears constantly throughout exception-handling
-code like ours, so it adds up. Not a security difference — purely
-readability — but worth knowing which Java version you need if you're
-trying to copy this pattern into an older codebase.
+A readability win, nothing more, but it appears all over error-handling code,
+so it adds up.
 
-### Where this is weak
+### Where it's still weak
 
-- **No token family revocation.** As mentioned, detecting a reused
-  (already-rotated) refresh token currently just rejects that one
-  request. A more complete implementation would revoke every token
-  descended from that same original login (the whole "family"), forcing
-  the legitimate user to log in again — treating a reuse as a strong
-  signal of compromise. We don't currently have any way to *notify* a
-  user this happened (no email infrastructure), which is part of why we
-  didn't build the more aggressive response — silently logging someone
-  out with no explanation is its own bad experience.
-- **No "log out everywhere" endpoint.** There's no way to revoke every
-  refresh token for a given user in one action (useful if a user
-  suspects their account is compromised, or after a password change).
-  Would be a straightforward addition: one query,
-  `UPDATE refresh_tokens SET revoked = true WHERE user_id = :id`.
-- **No device/session listing.** A user has no way to see "here are the
-  3 devices currently logged into my account" or revoke one specifically.
-  Real products (GitHub, Google) offer this; it requires tracking a bit
-  more metadata per refresh token (device name, IP, last used) than we
-  currently store.
+- **No token-family revocation.** On detecting reuse we reject that one request.
+  A stricter design would revoke *every* token descended from that login and
+  force a fresh password. We didn't, partly because we can't tell the user it
+  happened (no email infrastructure), and silently logging someone out with no
+  explanation is its own bad experience.
+- **No "log out everywhere".** One query would do it
+  (`UPDATE refresh_tokens SET revoked = true WHERE user_id = :id`). Worth adding
+  after password changes.
+- **No device list.** Real products show "you're signed in on 3 devices". That
+  needs extra metadata per refresh token that we don't store.
 
 ---
 
-## 6. The Spring Security filter chain
+## 6. The filter chain
 
-### The problem
+### Why it matters
 
-Before a request ever reaches a `@RestController` method, a lot of
-cross-cutting concerns need to happen: is this request even allowed
-through at all, is there a valid identity attached to it, is that
-identity allowed to do what it's asking. Doing this inside every
-controller method (`if (!isAuthenticated()) return 401;` at the top of
-every method) is repetitive and easy to forget in a new endpoint. Filters
-solve this by running *before* routing, uniformly, for every matching
-request, whether or not the developer writing a new controller method
-remembers to think about security at all.
+Before a request reaches your `@RestController`, a lot has to happen: is it
+even allowed through, is there an identity attached, is that identity allowed
+to do this. You *could* put `if (!loggedIn) return 401;` at the top of every
+controller method. You'd also eventually forget it in one, and that one is the
+endpoint that gets found. Filters fix this by running before routing, for every
+matching request, whether or not the person writing the next endpoint
+remembers security exists.
 
-### What we built, in actual chain order
+### What we built
+
+This is the order a request walks through. It's deliberate:
 
 ```
-1. RequestSizeLimitFilter   — reject oversized bodies before anything reads them
-2. RateLimitFilter          — reject excessive requests to auth endpoints
-3. JwtAuthenticationFilter  — populate SecurityContext from a bearer token, if present
-4. (Spring's built-in filters: CORS, CSRF (disabled), session management,
-   the actual UsernamePasswordAuthenticationFilter our custom ones sit
-   "before")
-5. AuthorizationFilter      — enforces .hasRole(...) / .authenticated() rules
-6. → finally, DispatcherServlet routes to the matching @RestController
+1. RequestSizeLimitFilter    reject oversized bodies before anything reads them
+2. RateLimitFilter           throttle login/register
+3. JwtAuthenticationFilter   if there's a valid bearer token, fill the SecurityContext
+4. Spring's own filters      CORS, headers, session handling, and so on
+5. AuthorizationFilter       enforce .hasRole(...) and .authenticated()
+6. DispatcherServlet         finally route to your controller
 ```
 
-Every custom filter extends `OncePerRequestFilter`, which is Spring's
-own base class guaranteeing the filter runs exactly once per request
-even if the servlet container internally forwards/dispatches the request
-more than once (this can genuinely happen — error dispatches,
-async request handling — and a filter that isn't idempotent-safe could
-double-count a rate limit hit or double-validate a token unnecessarily).
+The cheap, dumb rejections come first. There's no reason to parse a JWT for a
+request we're going to throw out for being 500MB. Each of our three filters
+extends `OncePerRequestFilter`, which guarantees it runs once per request even
+if the container re-dispatches internally (error dispatches and async handling
+can do that), so we never double-count a rate limit hit.
 
-Filter *order* is not incidental — we deliberately register
-`RequestSizeLimitFilter` before `RateLimitFilter` before
-`JwtAuthenticationFilter`, all positioned "before"
-`UsernamePasswordAuthenticationFilter` using
-`.addFilterBefore(filter, UsernamePasswordAuthenticationFilter.class)`.
-Registering something "before" the same anchor class multiple times
-preserves your *registration* order among those — which is why the order
-we call `.addFilterBefore(...)` in `SecurityConfig` actually matters and
-isn't just a Spring Security implementation detail we got lucky with.
+How the ordering is actually expressed:
 
-### Alternatives we considered
+```java
+.addFilterBefore(requestSizeLimitFilter, UsernamePasswordAuthenticationFilter.class)
+.addFilterBefore(rateLimitFilter,        UsernamePasswordAuthenticationFilter.class)
+.addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+```
 
-**Spring MVC interceptors (`HandlerInterceptor`) instead of servlet
-filters.** Interceptors run *after* Spring MVC has already done handler
-mapping — meaning DispatcherServlet has already decided which controller
-method would handle the request. This is meaningfully later in the
-pipeline than a filter. For something like our size limit filter, which
-needs to reject a request before its body is even read, an interceptor
-is architecturally the wrong tool — filters run at the servlet level,
-before Spring MVC is even involved. Interceptors are the right tool for
-concerns that genuinely need to know *which* controller method is about
-to be invoked (e.g., reading a custom annotation on that specific
-method) — we don't have that need anywhere in this project.
+All three are anchored "before" the same built-in filter. When you do that,
+Spring Security keeps them in registration order, so the order you write these
+lines in matters. It isn't a lucky implementation detail. (Your actual stack
+trace from the actuator debugging session shows it: `RateLimitFilter` ahead of
+`JwtAuthenticationFilter`.)
 
-**Aspect-Oriented Programming (`@Around` advice via Spring AOP)** for
-something like rate limiting, applied as an annotation
-(`@RateLimited`) on specific controller methods instead of a blanket
-filter on specific URL paths. This is a legitimate, more granular
-alternative — it would let you rate-limit at the method level with
-different limits per endpoint, expressed declaratively. We didn't do
-this because our rate limiting only ever needed to apply to two URL
-paths, which a simple filter with an `if` check handles with far less
-machinery (no proxy creation, no aspect weaving, no separate annotation
-to define and document) than introducing Spring AOP into the project
-just for this one feature.
+The JWT filter has one important manners rule: **it never rejects a request
+itself.** If the header is missing or the token is bad, it simply doesn't fill the
+`SecurityContext`, and the request carries on unauthenticated. Rejection is the
+job of the authorization rules and our `AuthenticationEntryPoint` further down.
+That keeps one path for "you're not authenticated" instead of two, so a bad
+token and no token get identical responses.
+
+### What else we could have done
+
+**Spring MVC interceptors (`HandlerInterceptor`).** These run after MVC has
+already chosen which controller will handle the request, which is much later
+than a filter. For something like our size limit, which must reject before the
+body is read, that's the wrong tool. Interceptors are right when you genuinely
+need to know *which handler* is about to run (say, reading a custom annotation
+on that method). We never do.
+
+**AOP with an annotation** (`@RateLimited` on methods). More granular, and
+declarative. We skipped it because we only ever throttle two URL paths, and a
+filter with an `if` handles that with no proxies, no aspect weaving and no
+annotation to define and document.
 
 ### Java 17 vs Java 8
 
-`OncePerRequestFilter` and the whole filter API predate both versions —
-zero difference here from the framework's side. The place this shows up
-is in how we build small immutable response bodies inline inside a
-filter, like the raw JSON string in `RateLimitFilter`:
+The filter API predates both, so no framework difference. Where the JDK shows
+up is hand-written JSON in the rate limiter:
 
 ```java
-// Java 17 — text block
+// Java 17, text block
 response.getWriter().write("""
         {"status":429,"error":"RATE_LIMITED","message":"Too many requests, please try again later"}
         """);
 ```
 
-We actually wrote this as a single-line string literal in the real code,
-but a text block (Java 15+, so also unavailable on Java 8) is the more
-natural way to write a multi-line JSON literal without escaping every
-quote:
-
 ```java
-// Java 8 — no text blocks, every quote needs escaping, no multi-line literal
+// Java 8, escape every quote and concatenate
 response.getWriter().write(
     "{\"status\":429,\"error\":\"RATE_LIMITED\"," +
     "\"message\":\"Too many requests, please try again later\"}"
 );
 ```
 
-Not a security difference at all — purely about how painful it is to
-read and maintain a hand-written JSON literal in the source, which is
-part of why we use `ObjectMapper` to serialize our real `ApiError`
-objects everywhere else rather than hand-writing JSON strings — this raw
-string in the rate limiter is really the *one* place we cut that corner,
-specifically because pulling in the injected `ObjectMapper` for a
-two-field static message felt like more machinery than the situation
-warranted. Worth being honest that this is a minor inconsistency with
-the rest of the codebase's own standards.
+I'll be honest: in the real class that's a one-line string, not a text block,
+and it's the *one* place we hand-write JSON instead of serializing an `ApiError`
+with the injected `ObjectMapper`. It's a small inconsistency, and it's listed in
+the known gaps.
 
-### Where this is weak
+### Where it's still weak
 
-Because we register three custom filters (`RequestSizeLimitFilter`,
-`RateLimitFilter`, `JwtAuthenticationFilter`), plus everything Spring
-Security itself inserts, a request's actual path through the process
-before reaching a controller is now a dozen-plus classes deep — visible
-in the stack trace you shared earlier in this project when debugging the
-actuator issue. This is normal for Spring Security, but it's genuinely
-harder to reason about than a simple single `if` chain, and stack traces
-from this layer are intimidating to a newer developer. The mitigation is
-exactly this document and the class-level comments in each filter — the
-complexity is inherent to the framework, but it doesn't have to be
-undocumented.
+Between our three filters and Spring's own, a request goes through a dozen-plus
+classes before it hits a controller, which is why those stack traces look
+terrifying. That's normal for Spring Security, but it's harder to reason about
+than a simple `if` chain. The cure isn't removing it, it's documentation, which
+is what this file and the class comments are for.
 
 ---
 
-## 7. Authorization — roles vs the alternatives
+## 7. Authorization and roles
 
-### The problem
+### Why it matters
 
-Authentication answers "who are you." Authorization answers "what are
-you allowed to do." They're different questions and conflating them is a
-common source of real vulnerabilities — an app that only checks "are you
-logged in" and never checks "are you allowed to do *this specific
-thing*" is an app where any logged-in user can hit any endpoint,
-including admin ones, just by knowing the URL.
+Authentication asks "who are you?" Authorization asks "what are you allowed to
+do?" People blur those two constantly, and the result is the classic bug where
+anyone who's logged in can hit an admin URL just by knowing it.
 
 ### What we built
 
-Role-Based Access Control (RBAC), about as simple as RBAC gets: exactly
-two roles, `USER` and `ADMIN`, checked at the route level:
+About the simplest RBAC you can have: two roles, `USER` and `ADMIN`, checked per
+route.
 
 ```java
 .requestMatchers("/api/admin/**").hasRole("ADMIN")
+.anyRequest().authenticated()
 ```
 
-The role lives on the `User` entity as a plain string column, gets
-turned into a `GrantedAuthority` (`ROLE_ADMIN`) inside
-`UserDetailsImpl.getAuthorities()`, and Spring Security's
-`hasRole("ADMIN")` matches it (the `ROLE_` prefix convention is handled
-for you by `hasRole` — if you use `hasAuthority` instead, you write the
-full `"ROLE_ADMIN"` string yourself).
+The role is a plain string column on `users`. `UserDetailsImpl` turns it into an
+authority (`ROLE_ADMIN`), and `hasRole("ADMIN")` matches it. Spring adds the
+`ROLE_` prefix for you in `hasRole`; if you use `hasAuthority`, you write the
+full `"ROLE_ADMIN"` yourself. People trip on that constantly.
 
-### Alternatives we considered
+Two details that matter more than they look:
 
-**Attribute-Based Access Control (ABAC).** Instead of "does this user
-have the ADMIN role," ABAC evaluates arbitrary attributes of the user,
-the resource, and the context together — e.g. "can this user edit this
-document, given their department matches the document's department AND
-it's during business hours AND the document isn't locked." Spring
-Security supports this via `@PreAuthorize` with SpEL expressions
-referencing method arguments, or a full policy engine like OPA (Open
-Policy Agent) for genuinely complex rules. We don't need this — every
-authorization decision in this app reduces to either a role check or an
-ownership check (see section 8), and introducing a general-purpose
-policy engine for two decision types would be solving a much bigger
-problem than we have.
+**Order is part of the rule.** Spring evaluates these top to bottom and the
+first match wins. The `/api/admin/**` rule must sit above `anyRequest()`, or it
+would never be reached.
 
-**Access Control Lists (ACL) — Spring Security ACL module.** Lets you
-grant permissions on a *specific object instance* to a *specific user or
-role* (e.g., "user 47 can read document 12, specifically, regardless of
-their general role"). This is real infrastructure — it needs its own
-database tables tracking every individual grant — and it's the right
-tool when permissions genuinely vary per-object in ways a simple
-ownership check can't express (e.g., a shared document with some editors
-and some viewers). Our ownership model (section 8) — "you can touch it
-if you created it, full stop" — doesn't need this. If this project grew
-a "share this note with another user" feature, ACLs (or a simpler
-hand-rolled `note_shares` table) would become the right tool.
+**No admin signup.** There is deliberately no endpoint that creates an admin. A
+self-service "make me an admin" door would be a vulnerability on day one. You
+promote someone with one SQL statement, by hand.
 
-**A generic permission-string system** (`"notes:read"`, `"notes:write"`,
-`"admin:users:list"`, stored as a many-to-many between users/roles and
-permission strings, checked via `hasAuthority("notes:write")`). More
-flexible than fixed roles — you can compose fine-grained permissions into
-different role bundles without a code change. We don't have anywhere
-near enough distinct actions in this app to justify it; two roles and
-one admin route is the entire authorization surface. This is exactly the
-kind of "looks more enterprise" abstraction the original project brief
-told us to avoid building without a concrete need.
+### What else we could have done
+
+**ABAC (attribute-based).** Rules like "can edit if the document's department
+matches yours, and it's business hours, and it isn't locked." Spring supports
+this through `@PreAuthorize` with SpEL, or you can use a policy engine like OPA.
+Every decision in this app is either a role check or an ownership check, so a
+general policy engine would be solving a bigger problem than we have.
+
+**ACLs (Spring Security ACL).** Per-object grants: "user 47 can read document
+12, specifically." This is the right tool when permissions vary object by object,
+for example a shared document with some editors and some viewers. Our ownership
+rule ("you can touch it if you created it") doesn't need it. If you add "share
+this note with someone", you'd want ACLs or a simple `note_shares` table.
+
+**Permission strings** (`notes:write`, `admin:users:list`), composed into roles.
+More flexible than two fixed roles. We have two roles and one admin route, so it
+would be abstraction for its own sake, which the project brief told us not to
+build.
 
 ### Java 17 vs Java 8
 
-No real difference — `hasRole(String)` is a plain method call on a
-builder, string literals are string literals in any Java version. The
-`enum` we'd reach for if we had a fixed, closed set of roles known at
-compile time is identical in both:
+No difference. `hasRole` is a method call on a builder. The enum you'd use for a
+fixed set of roles is identical on both:
 
 ```java
-// identical in Java 8 and Java 17
-public enum Role {
-    USER, ADMIN
-}
+public enum Role { USER, ADMIN }
 ```
 
-We actually store role as a plain `String` on `User`, not this enum —
-worth calling out as a minor inconsistency. Using an enum here would
-give us compile-time safety (`Role.ADMIN` can't be typo'd the way a raw
-string `"ADIMN"` can) at the cost of needing a JPA `@Enumerated` mapping.
-A reasonable improvement if this project grows more roles.
+We *don't* actually use this. Role is a raw `String`, which means `"ADIMN"` is a
+typo the compiler can't catch. An enum with `@Enumerated(EnumType.STRING)` would
+fix that, and it's a worthwhile improvement as soon as you have a third role.
 
-### Where this is weak
+### Where it's still weak
 
-Two roles total, and `USER` vs `ADMIN` is a completely flat hierarchy —
-there's no "ADMIN implies USER" relationship expressed anywhere; an
-admin account also needs the routes that `.anyRequest().authenticated()`
-covers to work, which they do, but only because we never scoped a route
-as "USER only, explicitly excluding ADMIN." If you ever need a role
-hierarchy (e.g., a `MODERATOR` role that's a subset of `ADMIN`'s
-powers), Spring Security has `RoleHierarchy` support for exactly this,
-unused here because we've never needed more than two flat roles.
+The roles are flat: nothing says ADMIN implies USER. That's fine for two roles.
+If you ever add a MODERATOR that's a subset of ADMIN, look at Spring's
+`RoleHierarchy` instead of duplicating rules. Also, a role change doesn't take
+effect until the user's next token, because the role is read when the token is
+used to load the user. With a 1-hour access token, demoting someone isn't
+instant for up to an hour. For this app that's acceptable, but it's good to
+know.
 
 ---
 
-## 8. Resource ownership vs authorization
+## 8. Resource ownership
 
-### The problem
+### Why it matters
 
-Role-based authorization answers "can a USER hit this endpoint at all."
-It says nothing about *which* note a given USER should be able to fetch
-by ID. Without an explicit check, any authenticated user could request
-`/api/notes/1`, `/api/notes/2`, `/api/notes/3`... and read everyone's
-notes, despite being correctly authenticated and correctly authorized by
-role.
+A role check says "a USER may call `/api/notes/{id}`". It says nothing about
+*whose* note `{id}` is. With only role checks, any logged-in user can walk
+`/api/notes/1`, `/2`, `/3` and read the whole table. This is one of the most
+common real-world vulnerabilities (it has a name, IDOR), and it's invisible to
+anyone who only tests the happy path.
 
 ### What we built
 
-Every note query is scoped by the authenticated user's own ID, resolved
-server-side, never trusted from client input:
+Every note query is scoped by the user ID taken from the verified token:
 
 ```java
 private Long currentUserId() {
-    Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
-    UserDetailsImpl principal = (UserDetailsImpl) authentication.getPrincipal();
+    Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+    UserDetailsImpl principal = (UserDetailsImpl) auth.getPrincipal();
     return principal.getId();
 }
 
@@ -1084,182 +830,143 @@ public Note getNote(@PathVariable Long id) {
 }
 ```
 
-The two ideas that make this actually secure, not just "usually works":
+Two ideas make it actually secure rather than "usually fine":
 
-1. **The owner ID never comes from the request.** Not a path parameter,
-   not a query parameter, not a request body field. It's derived purely
-   from the authenticated token. A request can't claim "I am user 47" —
-   the server already knows who it is from the JWT it just validated.
-2. **A note that exists but belongs to someone else returns the exact
-   same 404 as a note that doesn't exist at all.** This is deliberate.
-   Returning `403 Forbidden` for "exists but not yours" would let an
-   attacker enumerate valid note IDs by watching for 403 vs 404 — even
-   without ever reading the content, that's a real information leak
-   (confirms IDs exist, hints at total note count in the system, etc.).
+1. **The owner never comes from the request.** Not a path variable, not a query
+   param, not a body field. The server already knows who you are from the token
+   it just verified, so there's nothing for you to claim.
+2. **"Exists but isn't yours" looks identical to "doesn't exist".** Both are a
+    404. A 403 would tell an attacker the ID is real, and by watching 403 vs 404
+         they could map out which IDs exist and roughly how many notes the system
+         holds, without reading a byte of content.
 
-### Alternatives we considered
+`currentUserId()` reads a field off the principal that was loaded when the JWT
+was validated. It doesn't hit the database. That's worth saying because
+"current user" helpers in other codebases often do query on every call.
 
-**A generic "ownable resource" interface/base class** shared across
-Notes, Tasks, and Files, with a shared repository method or a base
-controller class handling the `currentUserId()` + scoped-lookup pattern
-once. We deliberately did *not* build this abstraction, even though it
-would reduce repetition once Tasks and Files exist. The reasoning,
-stated back when this decision came up: repeating a small, obvious
-pattern across a few controllers keeps each one self-contained and
-readable in isolation, versus routing every resource's security-critical
-lookup through a shared base class where a bug affects every resource
-type at once, and where a new reader has to go find and understand the
-base class to know what a subclass controller actually does. This is a
-judgment call, not a universal rule — a project with ten resource types
-instead of two or three would probably tip the balance toward sharing
-the pattern.
+### What else we could have done
 
-**Storing ownership as a JPA `@ManyToOne` relationship** instead of a
-plain `Long userId` column. We started this way, then deliberately
-switched to a plain column with native queries (see the commit history —
-this was an explicit mid-project change). The relationship mapping
-brings lazy-loading behavior (accessing `note.getOwner().getEmail()`
-outside an open Hibernate session throws `LazyInitializationException`)
-and hidden join behavior that's easy to get wrong without realizing it,
-especially for a project meant to be read by people still learning JPA's
-sharper edges. A plain foreign key column with an explicit
-`WHERE user_id = :userId` in a native query is more verbose per query,
-but what happens is fully visible in the code — nothing is implicit.
+**A shared "owned resource" base class or interface** so Notes, Tasks and Files
+reuse one scoped-lookup pattern. We deliberately didn't. Repeating a small,
+obvious pattern keeps each controller readable on its own, and it means a bug in
+a shared base class can't quietly break every resource at once. That's a
+judgment call, not a law: at ten resource types instead of three, I'd probably
+flip it and share.
+
+**A JPA `@ManyToOne` owner relationship** instead of a plain `userId` column.
+We started there and switched on purpose. The relationship brings lazy loading
+(touch `note.getOwner()` outside a session and you get a
+`LazyInitializationException`) and implicit joins that are easy to misread. A
+plain foreign key plus an explicit `WHERE user_id = :userId` is longer, but you
+can see exactly what runs.
 
 ### Java 17 vs Java 8
 
-No language-level difference in this pattern at all — it's a private
-method and a repository query, both plain since Java 5. Worth noting
-regardless: this is the one section where Java version genuinely doesn't
-matter even a little, which is itself useful to know — not every good
-practice in this codebase is tied to modern syntax; some of it is just
-"write the query correctly."
+No difference at all. It's a private method and a repository query, both plain
+since Java 5. I like keeping a section like this in the document, because not
+every good practice in the project is about modern syntax. Some of it is just
+"write the WHERE clause."
 
-### Where this is weak
+### Where it's still weak
 
-`currentUserId()` is duplicated, nearly verbatim, in every resource
-controller (see the "alternatives" discussion above for why that's a
-deliberate tradeoff, not an oversight). It also does an extra query —
-`UserDetailsImpl` already carries the ID from the JWT's claims without
-touching the database, so this is genuinely just a method reading a
-field, not a fresh lookup; worth stating plainly since "current user"
-methods in other frameworks often *do* hit the database unnecessarily,
-and ours specifically doesn't.
+The `currentUserId()` method is copy-pasted across resource controllers, by
+design (see above). The bigger risk is human: the pattern only protects the
+queries that *use* it. A new endpoint that calls plain `findById(id)` quietly
+reintroduces the hole, and nothing but code review will catch it. If that worries
+you, an integration test per resource that fetches user A's ID as user B is the
+cheap insurance.
 
 ---
 
 ## 9. CORS
 
-### The problem
+### Why it matters
 
-Browsers enforce the Same-Origin Policy by default: JavaScript running
-on `https://frontend.example.com` cannot read the response of a `fetch`
-call to `https://backend.example.com`, because the two are different
-origins (different domain), unless the *backend* explicitly says it's
-okay. This is a browser security feature protecting *users*, not a
-feature of our API — without it, any malicious website could silently
-make authenticated-looking requests to any API a victim happens to be
-logged into elsewhere, using the victim's own browser and (in a
-cookie-based world) their own ambient session cookie.
+Browsers enforce a rule called the Same-Origin Policy: JavaScript on
+`https://frontend.example.com` can't read a response from
+`https://backend.example.com`, because they're different origins, unless the
+backend explicitly says that's fine. Notice who this protects. It protects
+*users*, not your API. Without it, any website could silently fire requests at
+other sites using your logged-in browser and read the answers.
 
 ### What we built
 
-An explicit origin allow-list, different per Spring profile, wired into
-Spring Security's own CORS support (not just Spring MVC's, which Spring
-Security ignores unless told otherwise):
+An explicit allow-list, one per Spring profile, wired into Spring Security (not
+just Spring MVC):
 
 ```java
-@Bean
-@Profile("local")
+@Bean @Profile("local")
 public CorsConfigurationSource localCorsConfigurationSource() {
     return buildSource(List.of("http://localhost:5173"));
 }
 
-@Bean
-@Profile("prod")
+@Bean @Profile("prod")
 public CorsConfigurationSource prodCorsConfigurationSource() {
     return buildSource(List.of("https://your-frontend.vercel.app"));
 }
 ```
 
-`allowCredentials(false)` — deliberately, because we're a stateless
-bearer-token API, not a cookie-based one. This matters: browsers
-categorically refuse to combine a wildcard origin (`*`) with
-`allowCredentials(true)` — that combination is specifically disallowed
-by the CORS spec, because it would mean "any website can make
-authenticated, cookie-carrying requests to this API and read the
-response," which is close to the exact attack CORS exists to prevent.
-Since we don't use cookies for auth, we don't need `allowCredentials`
-at all.
+We set `allowCredentials(false)` because we authenticate with a bearer token,
+not cookies. That matters for a reason people get wrong: browsers flatly refuse
+to combine a wildcard origin with `allowCredentials(true)`, since that would
+mean "any site can make cookie-carrying requests and read the answer", which is
+very close to the attack CORS exists to stop. We don't need credentialed mode at
+all.
 
-### Alternatives we considered
+When a browser sends a request with a custom header like `Authorization`, it
+first sends a **preflight**, an `OPTIONS` request asking "is this allowed?". If
+your server doesn't answer that correctly, the real request never leaves the
+browser. That's why `Authorization` is in our `allowedHeaders`, and why the
+CORS config has to be known to Spring Security: the security filters run *before*
+MVC, and would otherwise reject the preflight before MVC's own CORS handling
+ever saw it.
 
-**A wildcard origin (`*`).** Works, trivially, and is genuinely
-tempting during development because it means never debugging a CORS
-rejection. The reason not to: it means literally any website on the
-internet can call our API from a victim's browser. Combined with a
-bearer token, the practical risk is lower than it would be with cookies
-(a malicious page can't *read* `localStorage` from another origin to
-steal the token in the first place — that's still protected by
-same-origin), but a wildcard still means any site's JS can attempt
-requests and, if it somehow already has a valid token (e.g. via an XSS
-bug on the legitimate frontend), read the response. An explicit
-allow-list costs nothing at runtime and removes an entire category of
-"we'll tighten it before shipping" technical debt that has a way of
-never actually getting tightened.
+> **Heads up:** CORS is not authentication and not a firewall. `curl`, Postman
+> and any server-side script ignore it completely. It only controls what *a
+> browser* will let page JavaScript do. Never rely on it to keep anyone out.
 
-**Configuring CORS purely in Spring MVC** (a `WebMvcConfigurer` bean with
-`addCorsMappings`) instead of through Spring Security. This is a common
-mistake, not really a valid alternative: Spring Security's filter chain
-runs *before* Spring MVC, so if Security doesn't know about your CORS
-config, a preflight `OPTIONS` request can get rejected or mishandled by
-the security filters before MVC's CORS handling ever gets a chance to
-respond. Hence `.cors(cors -> cors.configurationSource(...))` inside
-`SecurityConfig` specifically.
+### What else we could have done
 
-**Environment-variable-driven origins** instead of `@Profile`-gated Java
-beans. We actually started this way, then deliberately switched to
-hardcoded-per-profile Java (see the earlier discussion in this project's
-history) on the reasoning that an allowed origin is a public URL, not a
-secret, and profile-based Java code makes the mapping between
-environment and origin explicit and visible in one file, versus needing
-to check a deployment platform's environment variable configuration to
-know what's allowed. Both are legitimate; we simply favor "obvious from
-reading the repo" over "configurable without a redeploy" for this
-particular value, since it changes rarely.
+**A wildcard (`*`).** Easiest in development, since you never debug a CORS
+rejection. The cost is that any site on the internet can attempt requests from
+a victim's browser. With bearer tokens the practical risk is lower than with
+cookies, but "we'll tighten it before shipping" is the kind of promise that
+never gets kept. An explicit list costs nothing at runtime.
+
+**MVC-only CORS** (`WebMvcConfigurer.addCorsMappings`). This is a common mistake
+rather than a real alternative, for the filter-ordering reason above.
+
+**Origins from an environment variable.** We started there and switched. An
+allowed origin is a public URL, not a secret, so putting it in Java keyed by
+profile makes the mapping visible in one file, instead of hidden in a hosting
+dashboard. Both are legitimate. I just prefer "obvious from reading the repo"
+over "changeable without a redeploy" for a value that rarely changes.
 
 ### Java 17 vs Java 8
 
-Zero difference — `List.of(...)` is a Java 9+ convenience (not even a
-"Java 17" feature specifically), and on Java 8 you'd write
-`Arrays.asList(...)` or `Collections.singletonList(...)` instead. Not a
-security-relevant difference at all, purely a one-word API substitution.
+`List.of(...)` is Java 9+, so on Java 8 you'd write
+`Collections.singletonList("http://localhost:5173")` or `Arrays.asList(...)`.
+That's the entire difference. It has nothing to do with security.
 
-### Where this is weak
+### Where it's still weak
 
-The production origin (`https://your-frontend.vercel.app`) is currently
-a literal placeholder, not a real deployed URL — a reminder that this
-piece of config needs a real, deliberate value before the app is
-actually exposed to the internet, not something to leave on
-autopilot from a copy-pasted example.
+The production origin is a literal placeholder (`your-frontend.vercel.app`). It
+needs a real value before the app faces the internet, and it's the kind of thing
+that's easy to ship by accident. If the profile is missing entirely, neither
+CORS bean exists and the app refuses to start, which is the loud failure we
+want.
 
 ---
 
 ## 10. CSRF
 
-### The problem
+### Why it matters
 
-Cross-Site Request Forgery exploits *ambient* credentials — specifically,
-cookies, which browsers attach automatically to any request to a
-matching domain, regardless of which page on the internet triggered that
-request. Classic example: you're logged into your bank (cookie session),
-you visit a malicious page in another tab, that page has an invisible
-form auto-submitting a POST to your bank's "transfer money" endpoint —
-your browser helpfully attaches your real session cookie, because from
-the browser's point of view, it's just a normal request to a domain
-you're logged into. The bank's server can't tell the difference between
-"the user clicked transfer" and "a malicious page tricked the user's
-browser into submitting the same request."
+CSRF abuses *ambient* credentials, meaning cookies, which browsers attach to a
+request automatically no matter which page caused it. You're logged into your
+bank, you open a malicious page in another tab, and that page quietly submits a
+transfer form to your bank. Your browser helpfully attaches your real session
+cookie, and the bank can't tell "you clicked" from "a page tricked your browser."
 
 ### What we built
 
@@ -1267,757 +974,604 @@ browser into submitting the same request."
 .csrf(csrf -> csrf.disable())
 ```
 
-Disabled, deliberately, for a specific reason stated in the code and
-worth restating here: CSRF is fundamentally an attack on *ambient*
-credentials. We don't have any. Every request to this API needs an
-explicit `Authorization: Bearer <token>` header — and critically, a
-malicious third-party page cannot make a victim's browser attach an
-arbitrary custom header the way it can make it attach a cookie. The
-browser doesn't know or care about our JWT; it's just a string our
-frontend's own JavaScript reads from wherever it stored it and adds to
-the request manually. A page on `evil.example.com` has no way to read
-that value (it's not in a cookie, and even if it were in `localStorage`,
-same-origin policy prevents `evil.example.com`'s JS from reading
-`legit-frontend.example.com`'s `localStorage`) and therefore no way to
-forge a request carrying it.
+Disabled, and I want to be precise about *why*, because "APIs don't need CSRF"
+is the lazy answer and it isn't a rule. The reason here is that **we have no
+ambient credentials.** Every request needs an `Authorization: Bearer ...` header
+that our own frontend JavaScript adds by hand. A malicious page can't make your
+browser attach that header on its own, and it can't read the token to forge one,
+because the token isn't in a cookie and same-origin policy stops a different
+site from reading our site's storage. The attack has nothing to ride on.
 
-### Alternatives we considered
+### What else we could have done
 
-**Leaving CSRF protection enabled anyway, "just in case."** Spring
-Security's CSRF protection expects a CSRF token to be included in
-state-changing requests (POST/PUT/DELETE), generated server-side and
-delivered to the client, then echoed back on the next request as proof
-the request originated from a page that could actually read that token
-(same-origin policy again doing the real work). For a stateless bearer
-API, layering this on top of what the bearer token already provides
-would be pure friction with no additional protection — the vulnerability
-that CSRF tokens defend against structurally doesn't apply to a
-credential a malicious page can't get the browser to attach on its own.
-We disabled it rather than leaving it on unnecessarily, but the decision
-is explicitly written down and dated in a code comment (`SecurityConfig`)
-rather than left as an unexplained default, precisely so a future reader
-doesn't assume it was an oversight.
+**Leave it on anyway.** Spring would then want a CSRF token echoed back on every
+POST/PUT/DELETE. For a stateless bearer API that adds friction and no protection,
+because the thing CSRF tokens defend against can't happen here.
 
-**Double-submit cookie pattern.** A CSRF-mitigation technique
-specifically for APIs that *do* use cookies for auth but want to avoid
-full server-side CSRF token session state. Not relevant to us at all
-since we don't use cookies for authentication.
+**Double-submit cookie.** A technique for APIs that *do* use cookies but don't
+want server-side token state. Irrelevant to us.
 
 ### Java 17 vs Java 8
 
-Not applicable — this is purely a configuration decision (a lambda
-disabling a feature), the exact same one line of code regardless of
-Java version.
+Not applicable. It's one lambda, the same on both.
 
-### Where this is weak / when to revisit
+### Where it's still weak, and when to revisit
 
-If this project ever added a cookie-based authentication mechanism
-*alongside* JWT — for example, a first-party web client using an
-`HttpOnly` session cookie instead of a JS-held bearer token, which as
-discussed in section 3 is a real security upgrade in some ways — CSRF
-protection would need to be re-enabled for whatever routes that cookie
-protects. This is exactly the kind of decision that must be revisited
-if the underlying assumption (no ambient credentials) ever changes; the
-code comment says so explicitly for that reason.
+This decision is only true while we have no cookie-based auth. If you ever add
+an `HttpOnly` session cookie (which, as section 3 says, is a real security upgrade
+in some ways), you must turn CSRF protection back on for those routes. The code
+comment says exactly that, so a future reader doesn't assume it was forgotten.
 
 ---
 
 ## 11. Rate limiting
 
-### The problem
+### Why it matters
 
-Without any limit, an attacker can attempt unlimited password guesses
-per second against `/api/auth/login`, or spam-create accounts via
-`/api/auth/register`. Every other security control in this project —
-hashing, JWT, ownership — is undermined if the front door to obtaining a
-valid credential has no friction at all.
+With no limit, a script can try thousands of passwords a minute against one
+account, or create junk accounts all day. Every other control, hashing, tokens,
+ownership, is undermined if the front door to getting a credential has no
+friction. This is also a *resource* problem: remember BCrypt is deliberately
+expensive, so a flood of login attempts costs us real CPU.
 
 ### What we built
 
-An in-memory, per-IP token bucket (Bucket4j), applied only to
-`/api/auth/login` and `/api/auth/register`, 5 requests per minute per IP,
-backed by a bounded, self-evicting cache (Caffeine) rather than an
-unbounded map (our first version had a real bug here — an unbounded
-`ConcurrentHashMap` that grew forever, fixed in a follow-up commit; worth
-reading that commit's message if you want to see the actual bug
-demonstrated).
+An in-memory, per-IP token bucket (Bucket4j) on `/api/auth/login` and
+`/api/auth/register` only, 5 requests a minute per IP, stored in a bounded,
+self-evicting Caffeine cache.
 
 ```java
 Bandwidth limit = Bandwidth.classic(5, Refill.greedy(5, Duration.ofMinutes(1)));
 ```
 
-"Token bucket" as a concept: imagine a bucket that holds up to 5 tokens.
-Every request consumes one token. The bucket refills at a steady rate
-(here, all 5 tokens back after a minute — "greedy" refill means it adds
-them all at once rather than trickling one back every 12 seconds; a
-"greedy" refill is simpler to reason about, a smoother trickle refill
-would allow slightly more consistent request pacing but adds complexity
-we didn't judge worth it here).
+Think of a bucket holding 5 tokens. Each request takes one. When it's empty
+you're told to wait, and it refills over time. "Greedy" refill means all 5 come
+back together rather than one every 12 seconds; it's simpler to reason about.
 
-### Alternatives we considered
+We only throttle those two paths on purpose. A logged-in user hitting
+`/api/notes` repeatedly is just using the app.
 
-**Resilience4j's `RateLimiter` module.** A well-regarded alternative to
-Bucket4j, part of a broader resilience toolkit (circuit breakers,
-retries, bulkheads) that this project doesn't otherwise need. Bucket4j
-is more narrowly focused on exactly the token-bucket algorithm, which
-made it the simpler dependency to reach for when we only need one
-capability from it.
+The first version had a real bug: it stored buckets in a plain
+`ConcurrentHashMap` that never evicted anything, so an attacker could grow
+memory forever just by sending one request from each of many IPs, without ever
+tripping the limit. The fix swapped it for Caffeine with `expireAfterAccess` and
+a `maximumSize`. The history of both commits is worth reading, because the bug
+is a good example of a "security feature" that was itself an attack surface.
 
-**Guava's `RateLimiter`.** Older, well-known, but designed primarily for
-*smoothing outbound* request rates (e.g., "don't call this downstream
-API faster than N times per second"), not for *rejecting inbound*
-requests over a limit with a clean HTTP-level response. It's the wrong
-shape of tool for this specific job, even though the underlying
-algorithm concept (token bucket) is similar.
+### What else we could have done
 
-**A dedicated API gateway** (Kong, Cloudflare rate limiting, AWS API
-Gateway's built-in throttling) doing rate limiting *before* traffic ever
-reaches the Spring Boot process at all. This is genuinely the more
-robust production answer — it defends against volumetric attacks before
-they even cost our application any CPU, and a properly configured
-gateway can do IP reputation, geographic filtering, and coordinate limits
-across multiple backend instances without any of the flaws documented
-below. We don't have one in front of this app currently (Render doesn't
-provide this by default the way Cloudflare or AWS would), so
-application-level rate limiting is what we have, explicitly documented
-as a stopgap rather than a complete solution.
+**Resilience4j's `RateLimiter`.** Good, but it's a piece of a bigger toolkit
+(circuit breakers, retries, bulkheads) that we don't otherwise use. Bucket4j is
+narrower, which made it the lighter dependency for one capability.
+
+**Guava's `RateLimiter`.** Built to *pace outgoing calls* ("don't hit this API
+faster than N per second"), not to *reject incoming requests with a clean HTTP
+response*. Same algorithm family, wrong shape of tool.
+
+**An API gateway or CDN** (Cloudflare, Kong, AWS API Gateway) doing this before
+traffic reaches the JVM at all. This is genuinely the more robust production
+answer, because floods get stopped before they cost you CPU, and gateways can do
+IP reputation and cross-instance coordination. We don't have one in front of
+this service, so application-level limiting is what exists, and it's documented
+as a stopgap.
 
 ### Java 17 vs Java 8
 
-Bucket4j and Caffeine's APIs are identical regardless of Java version —
-both are ordinary libraries with builder-pattern APIs, no
-version-specific language features involved in using them. The one place
-worth showing: the lambda passed to Caffeine's cache-loading method:
+Bucket4j and Caffeine use ordinary builder APIs, so there's no JDK difference.
+The line `buckets.get(clientIp, ip -> newBucket())` uses a lambda, which shipped
+in Java 8, so it's identical on both. It's a good reminder that "Java 8 vs 17"
+isn't one cliff. Lambdas (8), `var` (10), text blocks (15), records and pattern
+matching (16) and sealed classes (17) each landed separately.
 
-```java
-// Java 17 — same as Java 8 here, lambdas have existed since Java 8
-Bucket bucket = buckets.get(clientIp, ip -> newBucket());
-```
+### Where it's still weak
 
-Lambdas themselves shipped in Java 8, so this exact line is identical on
-both versions — a reminder that "modern Java features" isn't a single
-cliff edge at some particular version; lambdas (8), `var` (10), records
-(16), pattern matching for `instanceof` (16), text blocks (15), and
-sealed classes (17) all landed at different points, and a "Java 8 vs
-Java 17" comparison really means "which of these five-ish features would
-be unavailable," not one uniform difference.
+Every one of these is also written at the top of `RateLimitFilter.java` and in
+`docs/adr/002-rate-limiting.md`:
 
-### Where this is weak
-
-Documented in full, deliberately, directly in `RateLimitFilter.java`'s
-class comment and in `docs/adr/002-rate-limiting.md` — repeating the
-short version here because it's important enough not to bury: IP address
-is a weak identity (shared by everyone behind the same NAT/corporate
-network, trivially varied by an attacker with multiple IPs or a botnet),
-this is not distributed (each instance has its own bucket map, so
-horizontal scaling multiplies the effective limit), and we do not
-currently parse `X-Forwarded-For`, which means if this is ever deployed
-behind a reverse proxy or load balancer, `getRemoteAddr()` may return the
-proxy's IP rather than the real client's — a real risk to verify at
-deploy time, not a theoretical one.
+- **IP is a weak identity.** Everyone behind one NAT or office network shares an
+  address, so one bad actor can lock out the rest. A botnet or proxy pool
+  trivially rotates addresses.
+- **Behind a proxy it may be wrong.** On a platform like Render, `getRemoteAddr()`
+  can return the *proxy's* IP, so every user looks like the same person, unless
+  `X-Forwarded-For` is parsed correctly. We don't parse it. **Test this at deploy
+  time.** It's the most likely thing to bite.
+- **Not distributed.** Each instance keeps its own buckets, so two instances
+  double the effective limit.
+- **No graduated response.** A real user who mistypes five times is treated like
+  an attacker. There's no CAPTCHA fallback.
+- **Per-account protection doesn't exist.** One account hit from many IPs isn't
+  slowed at all. Account lockout is the complementary defense, which we looked at
+  and chose not to build yet (it lets an attacker lock a victim out on purpose,
+  and we have no email to tell the victim).
 
 ---
 
 ## 12. Security response headers
 
-### The problem
+### Why it matters
 
-Browsers respect a set of standard response headers that turn on
-specific protective behaviors — but only if the server actually sends
-them. Without them, a browser falls back to permissive legacy defaults
-that predate these protections existing at all.
-
-### What we built, header by header
-
-**`X-Content-Type-Options: nosniff`** — stops a browser from trying to
-"guess" a response's real content type by inspecting its bytes, ignoring
-whatever `Content-Type` we actually declared. Matters most for anything
-we might ever serve that originated as user input (a future file
-upload feature) — without this, a browser might decide bytes we labeled
-`image/png` actually "look like" HTML and render them as such, executing
-any embedded script.
-
-**`X-Frame-Options: DENY`** — prevents our responses from being rendered
-inside an `<iframe>` on another site, defending against clickjacking
-(an invisible iframe of a legitimate page laid over a fake UI, tricking
-a user into clicking something they didn't intend). `DENY`, not
-`SAMEORIGIN`, because this backend never serves a page meant to frame
-itself — we're a JSON API, there's no legitimate framing use case at
-all.
-
-**`Strict-Transport-Security`** (HSTS) — tells a browser "never attempt
-plain HTTP to this host again, for the next year, force HTTPS even if
-someone types `http://` or follows an old link." Defends against
-SSL-stripping, where a network-level attacker intercepts the *initial*
-plaintext request before it would have been upgraded to HTTPS. Only
-meaningful once actually served over real HTTPS (which Render provides)
-— browsers ignore this header entirely when received over plain HTTP,
-so it does nothing on `localhost` during development, which is expected,
-not a bug.
-
-**`Referrer-Policy: strict-origin-when-cross-origin`** — controls what
-gets sent in the `Referer` header on outbound navigation. This is the
-current OWASP-recommended default: full URL on same-origin, origin only
-(no path or query string) cross-origin, nothing at all on an HTTPS→HTTP
-downgrade. Prevents a URL that happens to contain something sensitive in
-its path or query from leaking to a third-party destination via the
-Referer header.
-
-**`Cache-Control: no-cache, no-store, must-revalidate`** — actually a
-Spring Security default we didn't have to add, kept and documented
-rather than overridden. Stops a shared proxy or the browser's own disk
-cache from persisting a response that might contain a token or personal
-data.
-
-### What we deliberately did NOT set, and why
-
-**`Content-Security-Policy` (CSP)** — arguably the single most powerful
-anti-XSS header that exists, and we don't set it. The reason: CSP is a
-directive for browsers rendering **HTML documents**, controlling which
-script/style/image sources a *page* may load from. This backend never
-serves HTML — it serves JSON, consumed by a separately-hosted frontend.
-A CSP header on a JSON response does essentially nothing, because
-there's no HTML document for a browser to apply the policy to. **CSP
-belongs on the frontend** (the Vercel-hosted React/whatever app), not
-here — worth stating explicitly so a security review of this backend
-doesn't flag its absence as an oversight.
-
-**`X-XSS-Protection`** — a legacy header for a now-entirely-removed
-browser feature. Chrome, Firefox, and Edge have all dropped support for
-the mechanism this header used to control, and current OWASP guidance
-is to explicitly *not* set it — in old, now-rare browsers that still
-honored it, this header could itself be turned into an attack vector
-(a known technique used it to intentionally *suppress* legitimate
-content rather than block malicious content). Better to rely on CSP
-(on the frontend) than resurrect a deprecated, sometimes-counterproductive
-header here.
-
-### Alternatives we considered
-
-Spring Security's `.headers(...)` DSL is really the only idiomatic way
-to do this within the framework; the realistic alternative is setting
-these headers manually via a `Filter`, which we already have three of —
-we specifically preferred the built-in DSL here because it's the
-framework's own blessed mechanism, gets maintained alongside Spring
-Security itself, and needs no custom filter-ordering reasoning the way
-our other filters do.
-
-### Java 17 vs Java 8
-
-No difference — this is entirely a fluent builder-style configuration
-API on `HttpSecurity`, unrelated to Java language version.
-
-### Where this is weak
-
-We're not currently setting `Permissions-Policy` (formerly
-`Feature-Policy`), which controls browser feature access (camera,
-microphone, geolocation) — not relevant to a JSON API with no camera/mic
-usage of its own, but again, this is a frontend concern more than a
-backend one, worth confirming is set correctly wherever the actual
-HTML-serving frontend lives.
-
----
-
-## 13. Error handling and information leakage
-
-### The problem
-
-Every error response is potential intelligence for an attacker. "Invalid
-password" vs "no such user" tells an attacker which emails are
-registered. A stack trace tells them your exact framework versions,
-internal class names, and sometimes even fragments of SQL. A generic
-"500 Internal Server Error" with no further detail, while frustrating
-for legitimate debugging, is exactly what you want an *attacker* to see
-— which creates a real tension this project resolves by keeping detailed
-information server-side (in logs) and generic information client-side
-(in the response).
+Browsers have a whole set of protective behaviors that only switch on when the
+server asks for them with the right response headers. Without them, the browser
+falls back to permissive legacy defaults from before those protections existed.
 
 ### What we built
 
-One enum (`ErrorCode`) maps every known failure to an HTTP status, a
-machine-readable string, and a default message — see
-`ARCHITECTURE.md` for the full reasoning on why this replaced a
-per-exception-class approach. The specific information-hiding decisions
-worth calling out:
+We set each header explicitly in `SecurityConfig`, with the reason next to it, so
+removing one later means overriding a documented decision rather than deleting a
+mystery line.
 
-- **Bad password vs. unknown email → identical error.** Both produce the
-  generic `BadCredentialsException` → the same response. If these
-  differed, an attacker could enumerate valid registered emails by
-  watching which response they get back.
-- **Someone else's note vs. a nonexistent note → identical 404.**
-  Discussed in section 8. Prevents ID enumeration.
-- **The generic `Exception` handler never includes `ex.getMessage()`.**
-  It logs it (server-side, full detail, full stack trace, at ERROR
-  level) but the client only ever sees `"Something went wrong"`. This is
-  the single most important line in the whole error-handling system —
-  every other handler is specific and safe by construction, but this
-  catch-all exists specifically to make sure a bug we didn't anticipate
-  can never accidentally leak an internal detail through an unhandled
-  exception's default message.
-- **`RestAccessDeniedHandler`'s message never names the required role.**
-  "You do not have permission to access this resource" — not "you need
-  ROLE_ADMIN for this." Naming the missing requirement tells an attacker
-  exactly what privilege to go acquire (e.g., via a separate
-  vulnerability, or social engineering) to get further.
+**`X-Content-Type-Options: nosniff`**. Stops the browser from guessing a
+response's type by peeking at its bytes and ignoring the `Content-Type` we sent.
+It matters most for anything that started life as user input (a future file
+upload): without it, bytes we labelled `image/png` that happen to look like HTML
+could get rendered and run as a page.
 
-### Alternatives we considered
+**`X-Frame-Options: DENY`**. Our responses can't be put inside an `<iframe>` on
+another site. That blocks clickjacking, where an invisible frame of a real page
+sits under a fake button. We're a JSON API with no page that frames itself, so
+`DENY`, not `SAMEORIGIN`.
 
-**RFC 7807 "Problem Details for HTTP APIs."** A standardized JSON shape
-for API errors (`type`, `title`, `status`, `detail`, `instance` fields),
-which Spring 6 / Boot 3 actually supports natively via
-`ProblemDetail`. We built our own `ApiError` shape instead, predating
-when we might have adopted the standard one, mostly because this project
-started before deciding to standardize on it and our shape does
-everything we need. If starting fresh today, `ProblemDetail` is worth
-considering purely for interoperability with tooling that expects the
-RFC 7807 shape — functionally, the security properties (what information
-gets included or excluded) are a choice you make regardless of which
-envelope shape wraps it.
+**`Strict-Transport-Security`** (HSTS, one year, with subdomains). Tells browsers
+"never talk to this host over plain HTTP again", which defeats SSL-stripping,
+where someone on the network intercepts the *first* plain-HTTP request before it
+would have upgraded. Browsers ignore HSTS received over plain HTTP, so you will
+**not** see it on `localhost`. That's correct, not a bug.
 
-**Different messages per validation failure type**, distinguishing "field
-missing" from "field too long" from "field wrong format" with different
-error codes each. We collapse all Bean Validation failures into one
-`VALIDATION_ERROR` code with a field-specific message. More granularity
-here is low-risk (validation errors aren't typically sensitive) and would
-be a reasonable enhancement; we kept it simple because nothing in this
-project's actual usage needed a frontend to branch logic based on *which
-kind* of validation failure occurred, only that one did.
+**`Referrer-Policy: strict-origin-when-cross-origin`**. Full URL for same-origin
+navigation, only the origin (no path, no query) cross-origin, nothing at all on an
+HTTPS-to-HTTP downgrade. It stops a URL that happens to contain something
+sensitive from leaking to a third party.
+
+**`Cache-Control: no-cache, no-store, must-revalidate`**. A Spring Security
+default we kept and documented instead of overriding. It stops proxies and the
+browser's disk cache from keeping responses that might hold tokens or personal
+data.
+
+### What we deliberately did not set
+
+**`Content-Security-Policy`.** It's arguably the most powerful anti-XSS header
+there is, and we leave it off *on purpose*. CSP tells a browser which script,
+style and image sources an **HTML page** may load. This backend never serves HTML,
+so a CSP header on a JSON response does essentially nothing. It belongs on the
+frontend, wherever the real HTML lives. I'm writing this down so nobody
+flags its absence as an oversight in a security review.
+
+**`X-XSS-Protection`.** A legacy header for a browser feature that no longer
+exists in any major browser, and OWASP now says not to set it, because in old
+browsers that still honoured it, it could be abused to *suppress* legitimate
+content. Rely on CSP (on the frontend) instead.
+
+### What else we could have done
+
+Setting headers by hand in a `Filter`. We already have three custom filters, and
+the `.headers(...)` DSL is the framework's own supported route, maintained
+alongside Spring Security, with no filter-ordering to reason about.
 
 ### Java 17 vs Java 8
 
-The `record` we use for `ApiError` is the clearest example of Java 17
-convenience showing up in a security-adjacent context — not because
-records add any security property, but because a smaller, more obviously
-correct class is less likely to accumulate an accidental mutable setter
-that some future contributor uses to sneak extra (possibly sensitive)
-data onto an already-built error response:
+None. It's fluent builder configuration, unrelated to the language version.
+
+### Where it's still weak
+
+We don't set `Permissions-Policy` (camera, mic, geolocation). A JSON API has no
+use for those, but it's another one to confirm on the frontend.
+
+---
+
+## 13. Error handling and what we refuse to say
+
+### Why it matters
+
+Every error response is intelligence for an attacker. "Wrong password" versus "no
+such user" reveals who's registered. A stack trace hands over framework versions,
+class names and sometimes SQL fragments. But a bare "500" with nothing else makes
+*your* debugging miserable. The way out is to split the audiences: the client
+gets something generic, and the server logs everything.
+
+### What we built
+
+One enum, `ErrorCode`, ties each failure to an HTTP status, a machine-readable
+string and a default message. `ApiException(ErrorCode, message)` is the single
+exception type you throw. (`ARCHITECTURE.md` explains why this replaced a class
+per failure.)
+
+The specific things we refuse to say, and why:
+
+- **Bad password and unknown email look the same.** Otherwise anyone can enumerate
+  which emails are registered.
+- **Someone else's note and a missing note are both 404.** See section 8.
+- **The catch-all handler never sends `ex.getMessage()` to the client.** It logs
+  it, with the whole stack trace at ERROR, and the client sees "Something went
+  wrong". This is the most important line in the error system. Every other
+  handler is specific and safe by construction, but the catch-all exists so a bug
+  you didn't foresee can't leak an internal detail through a default message.
+- **403s don't name the missing role.** "You do not have permission" is enough.
+  "You need ROLE_ADMIN" is a shopping list for an attacker.
+- **Unknown routes are 404s, not 500s.** Spring throws `NoResourceFoundException`
+  for a URL nobody handles. Until we mapped it, our catch-all turned a typo'd URL
+  into a 500 with a full stack trace and an ERROR log line, so every scanner that
+  poked at us looked like an outage.
+
+### What else we could have done
+
+**RFC 7807 "Problem Details".** There's a standard JSON shape for API errors
+(`type`, `title`, `status`, `detail`, `instance`), and Spring 6 supports it through
+`ProblemDetail`. We rolled our own `ApiError` because we started before settling
+on it and it does everything we need. Starting fresh today I'd look hard at
+`ProblemDetail` for tooling interoperability. What gets *included* is the security
+decision either way, whichever envelope you wrap it in.
+
+**One validation code per kind of failure** (missing, too long, wrong format). We
+use a single `VALIDATION_ERROR` with a field-specific message. Finer codes are
+low-risk and would be a fine upgrade. We just never had a frontend that needed to
+branch on them.
+
+### Java 17 vs Java 8
+
+`ApiError` is a record:
 
 ```java
-// Java 17
 public record ApiError(Instant timestamp, int status, String error, String message, String path) {
     public static ApiError of(ErrorCode code, String path) { /* ... */ }
     public static ApiError of(ErrorCode code, String message, String path) { /* ... */ }
 }
 ```
 
-A record's fields are `final` and there are no generated setters at all
-— it's genuinely harder to accidentally mutate an `ApiError` after
-construction than it would be with a conventional Java 8 class, where
-someone could add a `setMessage(String)` later for convenience and
-inadvertently make the object mutable in a way that invites bugs (e.g., a
-filter downstream "helpfully" appending debug info to an already-built
-error response before it goes out).
+Records aren't a security feature, but there's a genuine side benefit: every field
+is `final` and there are no setters, so nobody can later add a convenient
+`setMessage()` and let some downstream filter append debug text to an
+already-built error before it goes out. On Java 8 that setter is one careless
+edit away.
 
-### Where this is weak
+### Where it's still weak
 
-The `ex.getMessage()` capture for `DataAccessException` (section on
-database errors, built a few commits into this project) does walk the
-cause chain to extract `SQLState` and the root message for our own logs
-— correct and deliberate — but it's worth double-checking, if you extend
-this pattern to a new exception type, that you're never accidentally
-routing a caught internal message into the *client-facing* `ApiError`
-rather than only the server-side log line. This is an easy mistake to
-introduce later without noticing, since both code paths look superficially
-similar.
+> **Known gap:** a failed login currently produces a **500**, not a 401. The
+> `BadCredentialsException` thrown inside the login controller isn't an
+> `ApiException`, so it falls through to the catch-all handler. It was left alone
+> deliberately in an early commit with a note to fix it, and it never got fixed.
+> The fix is one handler for `AuthenticationException` returning
+> `ErrorCode.UNAUTHORIZED` (with the same generic message, so we don't leak which
+> part was wrong). Do this before you ship.
+
+Also, when you add a new exception handler, double-check that you never route a
+caught internal message into the *client-facing* `ApiError` instead of only the
+log line. The two code paths look similar, and it's an easy slip.
 
 ---
 
-## 14. Actuator exposure
+## 14. Actuator
 
-### The problem
+### Why it matters
 
-Spring Boot Actuator is extremely useful for operations (health checks,
-metrics, live log-level changes) and extremely dangerous if exposed
-carelessly — `/actuator/env` can reveal every configuration property
-including, depending on setup, imperfectly-masked secrets;
-`/actuator/heapdump` produces a full memory snapshot that could contain
-live JWT secrets, password hashes mid-verification, or session data;
-`/actuator/beans` maps your entire internal object graph, which is a
-gift to anyone probing for a way in.
+Actuator is wonderful for operations (health checks, metrics, changing log levels
+live) and dangerous if exposed casually. `/actuator/env` can expose configuration,
+`/actuator/beans` maps your internals for anyone probing for a way in, and
+`/actuator/heapdump` produces a full memory snapshot that can contain a live JWT
+secret and password hashes. "We'll lock it down later" is how those end up public.
 
 ### What we built
 
-Two independent locks, both of which must be separately changed for
-anything to leak:
+Two independent locks. Leaking something needs *both* changed:
 
-1. **`management.endpoints.web.exposure.include`** decides what exists
-   over HTTP at all. In production, only `health`, `info`, `metrics` are
-   even registered — everything else genuinely does not exist as an
-   endpoint, returning our own 404 `RESOURCE_NOT_FOUND`, not a 401 or
-   403 that would at least confirm something is *there* to be denied.
-2. **`SecurityConfig`'s `hasRole("ADMIN")` rule** on `/actuator/**`
-   (except the explicitly public `/actuator/health/**`) means even
-   something on the include-list still needs a valid admin token.
+1. **`management.endpoints.web.exposure.include`** decides what exists over HTTP at
+   all. In prod it's `health,info,metrics`. Anything else isn't registered, so it
+   returns our own 404. That's stronger than a 401 or 403, which would at least
+   confirm something is there.
+2. **`SecurityConfig`**: `/actuator/health/**` is public, because a platform
+   health checker has no token, and everything else under `/actuator/**` needs
+   ADMIN.
 
-`heapdump` and `shutdown` are never included in either environment's
-exposure list, full stop — not even behind the admin check, because the
-risk of a heap dump leaking live secrets is severe enough that "requires
-an admin token" isn't a comfortable enough bar on its own.
+`heapdump` and `shutdown` are never exposed anywhere, even behind the admin check.
+"An admin token" isn't a high enough bar for a file that contains your secrets.
 
-### Alternatives we considered
+The health endpoint also split into **liveness** (is the JVM alive?) and
+**readiness** (can it serve traffic, including the database?). Liveness must not
+depend on Postgres: if the database blips and a platform restarts services on
+failed liveness, it would reboot a perfectly healthy JVM for nothing.
 
-**A separate management port** (`management.server.port`), which puts
-actuator endpoints on an entirely different network port than the main
-application — the idea being you'd only expose that port internally
-(e.g., to a monitoring system on a private network), never to the public
-internet at all. This is genuinely the more robust pattern for a
-traditional server deployment. We don't use it here because Render (our
-target deployment platform) only routes a single public port per
-service, and the platform's own health check needs to reach
-`/actuator/health` on that same public port — a separate management port
-wouldn't be reachable by Render's health checker at all without
-additional platform-specific configuration we don't currently have.
+> **A bug worth remembering:** my first version of the properties had both
+> `include=health` and `exclude=*`. In Spring Boot, `exclude` beats `include`, so
+> that removed `health` too and `/actuator/health` fell through to the
+> static-resource handler. Keep it simple: use an `include` list and don't use
+> `exclude` unless you mean it.
 
-**HTTP Basic Auth specifically for actuator**, separate from our JWT
-scheme, is a common pattern in projects that don't otherwise have their
-own auth system actuator could piggyback on. We didn't need this since
-we already have a working role-based JWT system — reusing
-`hasRole("ADMIN")` was simpler than introducing a second, parallel
-credential scheme just for operational endpoints.
+### What else we could have done
+
+**A separate management port** (`management.server.port`) so actuator lives on a
+port you never expose publicly. That's the more robust pattern for a classic
+server. We don't use it because Render routes a single public port, and its own
+health check has to reach `/actuator/health` on that same port.
+
+**HTTP Basic just for actuator.** Common where there's no other auth system to
+reuse. We already have role-based JWT, so a second credential scheme only for
+operations would be extra surface for no gain.
 
 ### Java 17 vs Java 8
 
-Pure configuration-file and Spring Security DSL territory — zero
-language-version relevance.
+None. It's properties files and the Security DSL.
 
-### Where this is weak
+### Where it's still weak
 
-`show-details=never` in production means even a legitimate admin
-checking `/actuator/health` doesn't see *why* it's down (which component
-failed — DB? disk space?) without separately checking `/actuator/metrics`
-or the application logs. This is a deliberate safety-over-convenience
-tradeoff, correct for what an unauthenticated platform health-checker
-should see, but worth knowing you'll need to cross-reference logs for
-real incident diagnosis rather than expecting the health endpoint alone
-to tell the whole story.
+`show-details=never` in production means even a legitimate admin sees only
+`UP`/`DOWN` on the health endpoint, not *which* component failed. That's the right
+default for what an anonymous caller should see, but real diagnosis means reading
+logs and `/actuator/metrics`. Don't expect the health body to tell the story.
 
 ---
 
 ## 15. Request size limits
 
-### The problem
+### Why it matters
 
-Nothing prevents a client from sending an enormous request body. Jackson
-will attempt to buffer and parse whatever arrives; a handful of large
-concurrent requests can exhaust available memory before any of our own
-validation logic even runs, because the problem happens *during*
-deserialization, before a `@Valid` annotation gets a chance to reject
-anything.
+Nothing stops a client from sending an enormous body. Jackson will try to buffer
+and parse whatever arrives, so a handful of big concurrent requests can use up
+memory *during deserialization*, before any of your `@Valid` checks get a chance
+to say no.
 
 ### What we built
 
-A custom filter (`RequestSizeLimitFilter`) because — worth restating,
-since it surprises people — **there is no built-in Spring Boot property
-that caps a plain JSON request body size on the default embedded Tomcat.**
-`spring.servlet.multipart.*` properties only govern multipart/form-data
-(file upload) parsing, which is a completely separate code path from
-JSON body parsing.
+A custom filter, `RequestSizeLimitFilter`. Here's the part that surprises people:
+**Spring Boot has no property that caps a plain JSON body on Tomcat.** The
+`spring.servlet.multipart.*` settings only govern file uploads, which is a
+completely separate code path. The filter works in two layers, because either one
+alone can be dodged:
 
-The filter checks two things: a declared `Content-Length` over the limit
-gets rejected immediately, before a single byte is read (cheapest
-possible rejection). For requests using chunked transfer encoding (no
-declared length at all) or a dishonestly small declared length, we wrap
-the input stream in a counter that throws once actual bytes read exceed
-the limit, mid-parse.
+1. If the declared `Content-Length` is over the limit, reject with 413 before
+   reading a single byte.
+2. Otherwise wrap the input stream in a counter that throws the moment real bytes
+   exceed the limit. That catches chunked requests (no declared length) and
+   clients that lie about it.
 
-We also added field-level `@Size` constraints (note title capped at 255
-to match the database column, content capped at 100,000 characters,
-passwords capped at 72 bytes to match BCrypt's own internal truncation
-point) so oversized *individual fields* produce a clean 400 from Bean
-Validation rather than reaching the database and failing there as an
-unhandled 500.
+On top of that, field-level `@Size` limits: note title 255 (matching the
+`VARCHAR(255)` column), note content 100,000, email 254, password 8 to 72. Before
+those existed, a 300-character title passed validation, hit Postgres, and came
+back as a **500**: a client mistake reported as our fault, and noise in the ERROR
+logs. Passwords cap at 72 because BCrypt only looks at the first 72 bytes, so
+accepting megabytes just means reading and hashing junk.
 
-### Alternatives we considered
+Multipart is switched **off** (`spring.servlet.multipart.enabled=false`) until a
+file endpoint exists. If you leave it on, multipart parsing happens inside the
+servlet container, bypassing our counting stream, and can write temp files to
+disk. When you do build uploads, use limits like these and exempt that path from
+the 1MB JSON cap:
 
-**Switch to the Undertow embedded server**, which does have a native
-`server.undertow.max-http-post-size` property covering exactly this,
-with no custom filter needed. A completely valid choice — we stayed on
-the default Tomcat because switching embedded servers is a bigger,
-less-obviously-justified change than adding one filter class, especially
-for a project meant to demonstrate patterns applicable to the far more
-common default (Tomcat) setup most Spring Boot tutorials and production
-deployments actually use.
+```properties
+spring.servlet.multipart.enabled=true
+spring.servlet.multipart.file-size-threshold=2KB   # in memory below this, temp file above
+spring.servlet.multipart.max-file-size=10MB        # per file
+spring.servlet.multipart.max-request-size=15MB     # whole request
+```
 
-**A reverse proxy / CDN-level body size limit** (nginx's
-`client_max_body_size`, or equivalent on a platform like Render/Cloudflare)
-sitting in front of the application entirely, rejecting oversized
-requests before they ever reach the JVM at all — strictly better for
-resource protection, since the JVM process never sees the oversized
-request. We don't currently have such a proxy configured for this
-project's deployment target, so the application-level filter is the only
-layer doing this job right now — worth adding a proxy-level limit too, if
-one becomes available in your deployment environment, as defense in
-depth rather than a replacement.
+### What else we could have done
+
+**Switch to Undertow**, which has a native `server.undertow.max-http-post-size`.
+Valid, but changing embedded servers is a bigger move than adding one filter, and
+this repo should show the far more common Tomcat setup.
+
+**A reverse proxy limit** (nginx `client_max_body_size`, or the platform's
+equivalent) so oversized requests never reach the JVM at all. Strictly better for
+resource protection, and I'd add it as defense in depth if your host offers it. We
+don't have one in front of this service, so the filter is the only layer today.
 
 ### Java 17 vs Java 8
 
-The `CountingInputStream` inner class implementing `ServletInputStream`
-is ordinary object-oriented code — abstract method overrides, a
-constructor, a field. No Java 17 feature makes this meaningfully
-different from how you'd write it on Java 8; this is one of the more
-"boring," version-agnostic corners of the whole project, worth naming
-specifically because it's a useful reminder that not every piece of code
-benefits from or needs modern syntax — sometimes a plain class is exactly
-the right, unglamorous tool.
+The `CountingInputStream` is an ordinary class overriding abstract methods. It
+looks the same on both versions. Not every piece of code needs modern syntax, and
+sometimes a plain class is the right unglamorous tool.
 
-### Where this is weak
+### Where it's still weak
 
-The 1MB limit is uniform across every JSON endpoint. A future file
-metadata endpoint, or any endpoint accepting genuinely large text content,
-would need either a higher limit or a path-specific override — the
-filter's own comment flags this explicitly as something to revisit when
-a file-upload feature is actually built, rather than leaving future
-maintainers to discover the ceiling the hard way.
+One flat 1MB cap for all JSON endpoints. A future endpoint with genuinely large
+text needs a path-specific override, and the filter's own comment says so, so
+nobody has to find the ceiling the hard way. Also, slow-dribble attacks (a client
+sending one byte every few seconds) are only covered by Tomcat's default
+connection timeouts.
 
 ---
 
-## 16. Secrets management
+## 16. Secrets
 
-### The problem
+### Why it matters
 
-A secret committed to git is compromised forever, even if you delete it
-in a later commit — git history keeps every prior version, anyone with
-clone access (or access to a public repo, ever, even briefly) can find
-it by searching history. This is categorically different from a bug you
-can just fix going forward.
+A secret committed to git is compromised *forever*. Deleting it in a later commit
+doesn't help, because history keeps every version and anyone who ever cloned or
+could read the repo can find it. This is a different category from a normal bug
+you can fix going forward.
 
 ### What we built
 
-Every genuine secret — `DATABASE_PASSWORD`, `JWT_SECRET` — is read via
-Spring's `${VAR_NAME}` placeholder syntax pointing at an OS environment
-variable, never given a default value in any committed file. An
-unresolved placeholder makes Spring Boot fail at startup with a clear
-error naming the missing property — deliberately fail-loud rather than
-silently falling back to something insecure or simply broken. Contrast
-this with *configuration* that isn't sensitive (CORS origins, rate limit
-thresholds, retention durations) which we do commit directly, because
-there's no confidentiality requirement and having it visible in the repo
-means changes to it show up in `git log` and code review, which is a
-genuine benefit for things that aren't secrets.
+Every genuine secret (`DATABASE_PASSWORD`, `JWT_SECRET`) is read through a
+`${VAR_NAME}` placeholder from an OS environment variable and never has a default
+in any committed file. If a placeholder can't be resolved, Spring fails at
+startup with an error naming the missing property. That's on purpose: fail loud
+rather than quietly start with something broken or insecure.
 
-### Alternatives we considered
+The line we draw: **secrets go in the environment, plain configuration goes in the
+repo.** CORS origins, rate limits, retention durations and size limits aren't
+confidential, and keeping them committed means a change shows up in `git log` and
+code review, which is a real benefit for non-secret values. Don't put something in
+an environment variable just because it feels more "professional". Put it there
+because it would hurt if someone read it.
 
-**A dedicated secrets manager** (AWS Secrets Manager, HashiCorp Vault,
-Google Secret Manager, or Render's own environment variable groups with
-sync capabilities). These add real capabilities plain environment
-variables don't have: automatic secret rotation, fine-grained access
-audit logs (who read this secret and when), and centralized management
-across multiple services/environments instead of copy-pasting the same
-value into several platforms' dashboards by hand. We use plain
-environment variables because this project's scale — one backend
-service, no fleet of microservices sharing secrets — doesn't yet justify
-the operational overhead of running or subscribing to a separate secrets
-management system. This is a very reasonable thing to introduce as a
-project grows past a handful of services.
+> **Never commit a `.env` file**, not even one with placeholder-looking values.
+> Someone will paste a real value into it one day. Set variables in your IDE run
+> configuration or your shell, and document them (see `CONFIGURATION.md`).
 
-**Spring Cloud Config Server** with encrypted properties, a
-Spring-ecosystem-native way to centralize configuration (including
-encrypted secrets) across multiple services. Similar reasoning to
-above — real value at multi-service scale, unnecessary overhead for one
-service.
+### What else we could have done
 
-**`.env` files loaded via a library like `dotenv-java`.** Convenient for
-local development (one file instead of manually exporting several
-variables every session), genuinely risky as a habit — a `.env` file
-sitting in a project directory is one accidental `git add .` away from
-being committed, and "just remember to gitignore it" has a well-documented
-track record of eventually failing for *someone* on *some* team. We
-chose to document environment variables clearly (see
-`docs/CONFIGURATION.md`) and rely on IDE run-configuration environment
-variables or shell exports instead, specifically to avoid ever having a
-file that *looks like* it should be committed sitting in the project
-directory at all.
+**A real secrets manager** (AWS Secrets Manager, Vault, Google Secret Manager).
+These give you rotation, access audit logs ("who read this and when") and one
+place to manage values across services, instead of pasting the same value into
+several dashboards. We use plain environment variables because one service doesn't
+justify that overhead yet, and it's a very reasonable thing to adopt as you grow.
+
+**Spring Cloud Config with encrypted properties.** The Spring-native way to
+centralize configuration across services. Same reasoning: real value at multi-service
+scale, overhead at one.
+
+**A `.env` loader** such as `dotenv-java`. Convenient locally, but it leaves a file
+in the project directory that is one stray `git add .` from being committed. "Just
+remember to gitignore it" has a long track record of failing for someone eventually.
 
 ### Java 17 vs Java 8
 
-Not language-relevant — `${VAR_NAME}` placeholder resolution is a Spring
-Framework property-source feature, unrelated to the Java language
-version running underneath it.
+None. Placeholder resolution is a Spring property-source feature, unrelated to the
+JDK.
 
-### Where this is weak
+### Where it's still weak
 
-No secret rotation mechanism exists for either the database password or
-the JWT secret — rotating either today means manually updating the
-environment variable and restarting the process, and for the JWT secret
-specifically (see section 4's "where this is weak"), rotating it
-invalidates every currently-valid token still in circulation, an
-operational event with no graceful transition path currently built.
+No rotation for either secret. Rotating the database password means updating the
+variable and restarting. Rotating `JWT_SECRET` also logs every user out at once,
+and there's no graceful transition (see section 4 on `kid`).
 
 ---
 
-## 17. Logging as a security control
+## 17. Logging as a security tool
 
-### The problem
+### Why it matters
 
-The client-facing response is deliberately generic for nearly every
-failure (section 13). Without a complementary server-side record, that
-same principle — hiding detail from the client — would also mean hiding
-it from *us*, leaving no way to actually investigate what happened when
-something goes wrong or someone attempts to attack the system.
+We made the *client* see almost nothing on failure. If the server also recorded
+almost nothing, we'd have locked ourselves out of our own investigations. Logs are
+where the detail we refuse to show the client goes.
 
 ### What we built
 
-Every failure path logs independently of, and in addition to, whatever
-the client receives, with severity matched to actual significance:
+Every failure path logs, independent of what the client receives, at a level that
+matches how much it matters:
 
-- **`ERROR`** — reserved for genuinely unexpected exceptions (the
-  generic `Exception` catch-all, database exceptions). These get the
-  full exception object passed to the logger (not just
-  `ex.getMessage()`), which SLF4J renders as a complete stack trace
-  including the full cause chain — this is exactly the detail we refuse
-  to send to a client, kept for ourselves.
-- **`WARN`** — expected-but-notable failures: authentication failures,
-  access-denied events, rate-limit rejections, account-related security
-  events. Not bugs in our code, but events worth being able to search
-  for and count.
-- **`INFO`** — routine, low-signal events: validation failures, 404s
-  from genuinely unknown routes. Recorded, but deliberately not noisy
-  enough to bury real problems when scanning logs.
+- **ERROR** is for the genuinely unexpected: the catch-all, database exceptions.
+  We pass the whole exception object to the logger, not just `getMessage()`, so
+  SLF4J prints the full stack trace and cause chain. That's exactly the detail we
+  won't send to a client.
+- **WARN** is for expected-but-notable events: authentication failures, access
+  denied, rate-limit rejections. These aren't bugs, but you want to be able to
+  search and count them.
+- **INFO** is for routine noise: validation failures, 404s on unknown routes. Kept,
+  but not loud enough to bury real problems.
 
-### Alternatives we considered
+Database exceptions get extra care. `ex.getMessage()` on a wrapped SQL failure is
+often just `could not execute statement`, which tells you nothing. The useful part
+(the SQLState code and the real driver message) lives deeper in the cause chain,
+so the handler walks the chain and logs `sqlState` and the root message as
+separate fields you can grep or alert on. (We checked this with a small experiment
+rather than trusting memory. The detail isn't lost with plain stack-trace logging,
+it's just buried and unsearchable.)
 
-**Logging failures directly into a database table**, enabling SQL
-queries like "show every failed login for this user in the last month."
-Deliberately not built. The reasoning, worth restating because it's a
-real anti-pattern worth naming: writing to the *same* database that's
-already under load, from *inside* the same request path that's already
-failing, means a database problem can now cause your error-handling
-code to itself throw a new error, potentially masking or corrupting the
-original failure you were trying to record. If a persisted, queryable
-audit trail becomes a genuine requirement, the correct shape is an
-async, best-effort write (a message queue, a separate write-behind
-process) — never synchronous, inline, in the exception-handling path
-itself.
+### What else we could have done
 
-**Structured JSON logging** (each log line emitted as a JSON object with
-named fields, rather than a formatted string) instead of SLF4J's default
-human-readable format. Genuinely the better choice for feeding logs into
-an aggregation system like Datadog, Elasticsearch, or Grafana Loki, since
-those tools can index and query structured fields far more efficiently
-than parsing formatted text. We use SLF4J's parameterized logging
-(`log.warn("... ip={} path={}", clientIp, path)`) which is *structured
-enough* to grep or basic-filter reliably, without adding a JSON logging
-library dependency this project's current scale doesn't yet need. Worth
-upgrading if/when real log aggregation tooling enters the picture.
+**Writing failures into a database table**, so you can query "every failed login
+for this user last month". We deliberately didn't. It means your error handling
+writes to the *same database* that may be the thing failing, from *inside* the
+request that's already failing, so a DB problem can now throw a fresh error from
+within your error handler and hide the original. If you genuinely need a queryable
+audit trail, make it an async, best-effort write (a queue or a separate
+write-behind), never inline in the request path.
+
+**Structured JSON logging.** Better if you feed logs into Datadog, Elasticsearch or
+Loki, since they index named fields much better than they parse formatted text.
+SLF4J's parameterized messages (`ip={} path={}`) are structured *enough* to grep
+today without a new dependency. Worth upgrading once real aggregation tooling shows
+up.
 
 ### Java 17 vs Java 8
 
-SLF4J's API (`Logger`, `LoggerFactory`, parameterized `{}` placeholders)
-predates both Java versions entirely — no relevant difference. The one
-place Java 17 helps readability, not security: our multi-branch
-cause-chain walking logic reads more clearly with pattern-matching
-`instanceof`, shown already in section 5's comparison.
+SLF4J predates both, so nothing differs. The only visible help from Java 17 is the
+cleaner cause-chain code from pattern-matching `instanceof` (section 5).
 
-### Where this is weak
+### Where it's still weak
 
-Nothing is currently correlating a single request's log lines together
-with a request ID (a common pattern: generate a UUID per incoming
-request, put it in the SLF4J MDC, have every log line for that request
-automatically include it). Right now, tracing "everything that happened
-during this one problematic request" across multiple log lines from
-different filters/handlers requires manually correlating by timestamp
-and other clues, rather than filtering by one ID. A reasonable near-term
-improvement.
+There's no request ID. A common pattern is to generate a UUID per request, put it
+in the SLF4J MDC, and have every log line carry it, so you can filter for
+"everything that happened during this one bad request". Today you correlate by
+timestamp and guesswork. It's a cheap, high-value addition. Also, never log tokens,
+passwords or full `Authorization` headers. We don't, and the first person to add
+`log.debug("request: {}", request)` should be stopped in review.
 
 ---
 
-## 18. Java 17 language features used, and their Java 8 equivalents
+## 18. Java 17 features used here
 
-A consolidated reference, gathering every place this project actually
-leans on a post-Java-8 feature, since the sections above scatter these
-throughout their specific security context.
+A single reference for every place this project leans on something newer than Java
+8, so you know what you'd lose by going back.
 
-### Records (Java 16+)
+**Records (16).** Used for `ApiError`, `LoginRequest`, `RegisterRequest`,
+`RefreshRequest`, `LoginResponse`, `CreateNoteRequest`, `IssuedToken`. All are pure
+data carriers: build, read, never mutate. On Java 8 each becomes a full class with
+private final fields, a constructor, getters, and hand-written `equals`, `hashCode`
+and `toString`. Small gotcha when porting: record accessors are `email()`, not
+`getEmail()`, and Jackson handles both, but your own calling code won't.
 
-Used for: `ApiError`, `LoginResponse`, `RegisterRequest`, `LoginRequest`,
-`RefreshRequest`, `CreateNoteRequest`, `IssuedToken`. Every one of these
-is a pure data carrier — construct it, read its fields, never mutate it.
-This is exactly the case records exist for. On Java 8, each becomes a
-full hand-written class: private final fields, a constructor, accessor
-methods (record accessors are `name()`, not `getName()` — a real,
-if minor, migration wrinkle if you ever port this back), plus
-`equals`/`hashCode`/`toString` if you want value semantics rather than
-identity semantics (records generate all three automatically; Java 8
-classes need them hand-written or generated by your IDE).
+**Pattern matching for `instanceof` (16).** The cause-chain walks in the exception
+handlers. Pure readability; it removes the cast line.
 
-### Pattern matching for `instanceof` (Java 16+)
+**`var` (10).** Used lightly, such as in the JWT filter. Local type inference only,
+identical bytecode.
 
-Used in: the `DataAccessException` cause-chain walk, the
-`RestControllerAdvice`'s type-checking logic in a couple of handlers.
-Collapses a cast-after-check into one expression. Purely readability —
-no functional or security difference from the Java 8 two-step version.
+**Text blocks (15).** Used for the multi-line SQL in `@Query`. On Java 8 you'd
+concatenate quoted lines with `\n`, which gets unreadable for SQL.
 
-### `var` (Java 10+)
+**Not used, and worth knowing:** enhanced `switch` expressions (14) and sealed
+classes (17). Our control flow around `ErrorCode` and `TokenType` doesn't need
+them. Sealed types would be a fit if error categories ever became a real type
+hierarchy carrying different data, instead of a flat enum.
 
-Used sparingly, e.g. `var authentication = new UsernamePasswordAuthenticationToken(...)`
-in `JwtAuthenticationFilter`. Purely local-variable type inference — the
-compiled bytecode is identical to writing the full type explicitly.
-Zero functional difference from Java 8, which requires spelling out
-`UsernamePasswordAuthenticationToken authentication = ...` in full.
-
-### Text blocks (Java 15+)
-
-Used in a couple of native `@Query` annotations (the multi-line SQL for
-`deleteExpiredBatch`) and could be used for the raw JSON literal in
-`RateLimitFilter` (currently written as a single-line string instead —
-noted as a minor inconsistency in section 6). On Java 8, any multi-line
-string needs explicit `\n` and string concatenation across lines, which
-gets genuinely hard to read for a multi-line SQL statement.
-
-### Enhanced switch expressions (Java 14+)
-
-Not currently used anywhere in this project — worth noting as an
-absence, not a presence. `TokenType` and `ErrorCode` are both handled via
-`enum` methods and `if`/`equals` checks rather than switch expressions.
-A reasonable modernization if this project's control flow around those
-enums grows more complex.
-
-### Sealed classes/interfaces (Java 17)
-
-Not used anywhere in this project. Would be a reasonable fit if
-`ErrorCode` or a similar closed-set concept ever needed to become a
-richer type hierarchy (e.g., different subclasses per error category
-carrying different extra data) rather than a flat enum — sealed types let
-you express "these are the only possible subtypes" with compiler-enforced
-exhaustiveness in a `switch`. Nothing in this project currently needs
-that level of structure.
-
-### What this all means practically
-
-None of the above changes what this application actually *does* from a
-security standpoint. Every feature in this list is a readability and
-boilerplate-reduction improvement, not a new capability. If you're
-maintaining a Java 8 codebase and reading this document for security
-guidance rather than syntax modernization, every architectural decision
-in sections 1 through 17 applies identically — you'll just be writing
-more lines per class to express the same ideas.
+**What it all adds up to.** None of these change what the app *does* securely. They
+cut boilerplate. If you maintain a Java 8 codebase and read this for guidance,
+every decision in sections 1 to 17 applies unchanged. You'll just type more lines
+to say the same thing.
 
 ---
 
-## 19. Decision summary table
+## 19. Decision table
 
-| Concern | We chose | Main alternative | Why not the alternative (short version) |
+| Concern | We chose | Main alternative | Why not (short version) |
 |---|---|---|---|
-| Password hashing | BCrypt | Argon2 | BCrypt is the more battle-tested Spring default; Argon2 is arguably stronger and worth it for a new project with no legacy constraint |
-| Session vs token | Stateless JWT | Sessions + Spring Session/Redis | Anticipated multi-origin, multi-instance deployment; sessions + Redis is a legitimate, arguably better choice for a same-origin app |
-| JWT signing | Symmetric HMAC (HS256) | Asymmetric RSA/EC | Only one process issues and verifies tokens; asymmetric matters once multiple services need to verify without the power to issue |
-| JWT library | jjwt | Nimbus JOSE+JWT | jjwt's fluent API is more approachable for a learning-focused project; Nimbus is the better fit for full JOSE/encrypted-token needs |
-| Refresh strategy | Rotating refresh tokens | No refresh tokens (re-login on expiry) | This project's use case (all-day sessions) justified the added complexity; many apps genuinely don't need this |
-| Authorization model | Flat RBAC (2 roles) | ABAC / ACL / permission strings | Only two roles and one admin route exist; more general models solve problems this app doesn't have |
-| Rate limiting | In-memory per-IP (Bucket4j) | Redis-backed distributed limiter / API gateway | Single instance, no adversarial traffic yet; documented as a stopgap, not a complete defense |
-| CSRF | Disabled | Enabled with token echoing | No ambient credentials (no cookies) for CSRF to exploit in the first place |
-| Actuator exposure | Allow-list + role check, two independent locks | Separate management port | Render routes one public port; platform health checks need the same port the app serves |
-| Schema management | Manual SQL per commit | Flyway / Liquibase | Deliberate choice for this project's teaching goals; **recommended to switch to a migration tool for any real team project** |
-| Secrets | Plain OS environment variables | Vault / cloud secrets manager | Single-service scale doesn't yet justify the operational overhead |
-| Logging | SLF4J to stdout | Database-backed audit log | Avoids coupling error handling to a database that might itself be the thing failing |
+| Password hashing | BCrypt | Argon2 | BCrypt is built in and well known; Argon2 is arguably stronger and fine for new projects |
+| Session vs token | Stateless JWT | Sessions + Spring Session/Redis | Expected separate frontend origin and multiple instances; Redis sessions are a legitimate, often better choice for same-origin apps |
+| JWT signing | HMAC (HS256) | RSA / EC | One process issues and verifies; asymmetric matters once many services verify |
+| JWT library | jjwt | Nimbus JOSE+JWT | Friendlier API for a readable repo; Nimbus for encrypted tokens |
+| Refresh strategy | Rotating refresh tokens | None, re-login on expiry | All-day-session use case justified it; many apps don't need it |
+| Authorization | Flat RBAC, 2 roles | ABAC / ACL / permission strings | Only two roles and one admin route exist |
+| Ownership | `user_id` column + scoped native query | `@ManyToOne` + shared base class | Visible SQL, no lazy-loading surprises, self-contained controllers |
+| Rate limiting | In-memory per-IP (Bucket4j) | Gateway / Redis limiter | Single instance, no hostile traffic yet; documented stopgap |
+| CSRF | Disabled | Enabled with tokens | No ambient credentials to exploit |
+| CORS | Per-profile allow-list in Java | Env-var origins / wildcard | Public URLs, not secrets; wildcard is too open |
+| Actuator | Allow-list + admin role | Separate management port | Render exposes one public port |
+| Request size | Custom filter + `@Size` | Undertow property / proxy limit | No Tomcat property exists; add a proxy limit too if you can |
+| Schema | Manual SQL | Flyway / Liquibase | Teaching choice; **use a migration tool on real team projects** |
+| Secrets | OS environment variables | Vault / cloud secrets manager | One service doesn't justify the overhead yet |
+| Logging | SLF4J to stdout | DB-backed audit table | Don't tie error handling to a database that may be failing |
 
 ---
 
-## Closing note
+## 20. Known gaps
 
-Every "where this is weak" section above is there on purpose. A security
-document that only explains what's good and never what's missing isn't
-actually useful to whoever reads this repo next — including a future
-version of whoever wrote it. If you're using this project as a base for
-something real: read the weak points relevant to your use case before
-you ship, not after.
+Everything I know is unfinished, in one list, roughly by how soon I'd fix it.
+
+1. **Failed login returns 500, not 401.** Add a handler for
+   `AuthenticationException`. Fix before shipping. (Section 13.)
+2. **`X-Forwarded-For` isn't parsed.** Behind Render, the rate limiter may treat
+   every user as one IP. Verify at deploy time. (Section 11.)
+3. **Production CORS origin is a placeholder.** (Section 9.)
+4. **No request ID in logs.** Cheap and valuable. (Section 17.)
+5. **No "log out everywhere".** One query. (Section 5.)
+6. **No refresh-token family revocation.** Needs a way to notify users first.
+   (Section 5.)
+7. **No JWT key rotation (`kid`).** (Section 4.)
+8. **`DelegatingPasswordEncoder` isn't used**, so no painless BCrypt upgrade path.
+   (Section 1.)
+9. **Role is a raw string, not an enum.** (Section 7.)
+10. **No account lockout.** A conscious decision, not an oversight; revisit if you
+    add email. (Section 11.)
+11. **One hand-written JSON string in `RateLimitFilter`.** Minor inconsistency.
+    (Section 6.)
+12. **Manual schema management.** Fine for learning, wrong for a team. (Section 19.)
+
+---
+
+## One last thing
+
+If you're taking this repo as a base for something real, read the "where it's
+still weak" part of every section that touches your use case *before* you ship,
+not after. A security document that only tells you what's good isn't doing its
+job, and I'd rather you find the holes in a markdown file than in production.
