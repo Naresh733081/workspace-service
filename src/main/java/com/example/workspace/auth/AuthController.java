@@ -11,8 +11,11 @@ import io.jsonwebtoken.Claims;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -32,6 +35,8 @@ public class AuthController {
     private final AuthenticationManager authenticationManager;
     private final JwtService jwtService;
     private final RefreshTokenRepository refreshTokenRepository;
+
+    private static final Logger log = LoggerFactory.getLogger(AuthController.class);
 
     // Responsible for actually WRITING the SecurityContext somewhere it will
     // survive between requests. HttpSessionSecurityContextRepository is the
@@ -64,13 +69,19 @@ public class AuthController {
     }
 
     @PostMapping("/login")
-    public ResponseEntity<?> login(@Valid @RequestBody LoginRequest request,
-                                   HttpServletRequest httpRequest,
-                                   HttpServletResponse httpResponse) {
+    public ResponseEntity<LoginResponse> login(@Valid @RequestBody LoginRequest request) {
         Authentication authRequest = new UsernamePasswordAuthenticationToken(request.email(), request.password());
 
-        // throws BadCredentialsException on failure
-        Authentication authResult = authenticationManager.authenticate(authRequest);
+        Authentication authResult;
+        try {
+            authResult = authenticationManager.authenticate(authRequest);
+        } catch (BadCredentialsException ex) {
+            // Spring throws this for a wrong password AND for an unknown email
+            // (it hides user-not-found on purpose), so both land here and the
+            // client can't tell which one it was.
+            log.warn("Login failed: email={}", request.email());
+            throw new ApiException(ErrorCode.INVALID_CREDENTIALS);
+        }
 
         // UserDetailsImpl already carries the id — DaoAuthenticationProvider
         // loaded it once during authenticate() above via

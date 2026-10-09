@@ -16,7 +16,7 @@ rather you hear about the holes from me.
 > *where it's still weak*. Skip around freely. Nothing depends on reading in order.
 
 > **A word on honesty:** a few things in this repo are deliberately unfinished.
-> They're marked **Known gap** and collected at the end. Nothing here is
+> They're collected in the **Known gaps** list at the end. Nothing here is
 > hidden, and none of it is "we'll fix it later" without saying so.
 
 ---
@@ -237,7 +237,9 @@ if the email doesn't exist, `DaoAuthenticationProvider` internally throws
 before it reaches you. That's on by default (`hideUserNotFoundExceptions`) and
 it's deliberate. An attacker should get the same failure for "no such user" and
 "wrong password". You'll never see the user-not-found case surface at the
-controller, and that's the feature working.
+controller, and that's the feature working. The controller catches that
+`BadCredentialsException` and rethrows it as our own `ApiException`, so the client gets a
+proper 401 in our standard error shape (section 13).
 
 ### What else we could have done
 
@@ -1177,8 +1179,9 @@ per failure.)
 
 The specific things we refuse to say, and why:
 
-- **Bad password and unknown email look the same.** Otherwise anyone can enumerate
-  which emails are registered.
+- **Bad password and unknown email look the same.** Both end up as a 401
+  `INVALID_CREDENTIALS` with the same body. Otherwise anyone can enumerate which emails
+  are registered.
 - **Someone else's note and a missing note are both 404.** See section 8.
 - **The catch-all handler never sends `ex.getMessage()` to the client.** It logs
   it, with the whole stack trace at ERROR, and the client sees "Something went
@@ -1225,13 +1228,21 @@ edit away.
 
 ### Where it's still weak
 
-> **Known gap:** a failed login currently produces a **500**, not a 401. The
-> `BadCredentialsException` thrown inside the login controller isn't an
-> `ApiException`, so it falls through to the catch-all handler. It was left alone
-> deliberately in an early commit with a note to fix it, and it never got fixed.
-> The fix is one handler for `AuthenticationException` returning
-> `ErrorCode.UNAUTHORIZED` (with the same generic message, so we don't leak which
-> part was wrong). Do this before you ship.
+> **Heads up:** login failures are translated inside `AuthController`, not in the
+> global handler. The controller catches `BadCredentialsException` and throws
+> `ApiException(ErrorCode.INVALID_CREDENTIALS)`, which comes back as a **401**. Wrong
+> password and unknown email take the same path, so the response is identical for both.
+> We catch `BadCredentialsException` *specifically*, not `AuthenticationException`. If
+> the database is down mid-login, Spring wraps that failure in
+> `InternalAuthenticationServiceException`, which is also an `AuthenticationException`.
+> Catching the broad type would tell a user their password is wrong during an outage and
+> hide the real problem. As it stands, an outage during login surfaces as a 500 and an
+> ERROR log, which is the truth.
+
+`INVALID_CREDENTIALS` is a separate code from `UNAUTHORIZED` on purpose. A frontend
+usually reacts to a 401 by trying a token refresh. If a failed login returned the same
+code as an expired token, that logic would try to refresh a session that never existed.
+A distinct code lets the frontend show "wrong email or password" and move on.
 
 Also, when you add a new exception handler, double-check that you never route a
 caught internal message into the *client-facing* `ApiError` instead of only the
@@ -1548,24 +1559,22 @@ to say the same thing.
 
 Everything I know is unfinished, in one list, roughly by how soon I'd fix it.
 
-1. **Failed login returns 500, not 401.** Add a handler for
-   `AuthenticationException`. Fix before shipping. (Section 13.)
-2. **`X-Forwarded-For` isn't parsed.** Behind Render, the rate limiter may treat
+1. **`X-Forwarded-For` isn't parsed.** Behind Render, the rate limiter may treat
    every user as one IP. Verify at deploy time. (Section 11.)
-3. **Production CORS origin is a placeholder.** (Section 9.)
-4. **No request ID in logs.** Cheap and valuable. (Section 17.)
-5. **No "log out everywhere".** One query. (Section 5.)
-6. **No refresh-token family revocation.** Needs a way to notify users first.
+2. **Production CORS origin is a placeholder.** (Section 9.)
+3. **No request ID in logs.** Cheap and valuable. (Section 17.)
+4. **No "log out everywhere".** One query. (Section 5.)
+5. **No refresh-token family revocation.** Needs a way to notify users first.
    (Section 5.)
-7. **No JWT key rotation (`kid`).** (Section 4.)
-8. **`DelegatingPasswordEncoder` isn't used**, so no painless BCrypt upgrade path.
+6. **No JWT key rotation (`kid`).** (Section 4.)
+7. **`DelegatingPasswordEncoder` isn't used**, so no painless BCrypt upgrade path.
    (Section 1.)
-9. **Role is a raw string, not an enum.** (Section 7.)
-10. **No account lockout.** A conscious decision, not an oversight; revisit if you
-    add email. (Section 11.)
-11. **One hand-written JSON string in `RateLimitFilter`.** Minor inconsistency.
+8. **Role is a raw string, not an enum.** (Section 7.)
+9. **No account lockout.** A conscious decision, not an oversight; revisit if you
+   add email. (Section 11.)
+10. **One hand-written JSON string in `RateLimitFilter`.** Minor inconsistency.
     (Section 6.)
-12. **Manual schema management.** Fine for learning, wrong for a team. (Section 19.)
+11. **Manual schema management.** Fine for learning, wrong for a team. (Section 19.)
 
 ---
 

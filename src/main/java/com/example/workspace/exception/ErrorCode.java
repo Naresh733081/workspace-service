@@ -9,6 +9,7 @@ import org.springframework.http.HttpStatus;
 public enum ErrorCode {
 
     VALIDATION_ERROR(HttpStatus.BAD_REQUEST, "Request validation failed"),
+    INVALID_CREDENTIALS(HttpStatus.UNAUTHORIZED, "Invalid email or password"),
     UNAUTHORIZED(HttpStatus.UNAUTHORIZED, "Authentication is required to access this resource"),
     ACCESS_DENIED(HttpStatus.FORBIDDEN, "You do not have permission to access this resource"),
     INVALID_TOKEN(HttpStatus.UNAUTHORIZED, "Invalid or expired authentication token"),
